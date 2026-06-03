@@ -1,0 +1,194 @@
+---
+title: "FF-PINN Particle Initialization Modes and Settings"
+sidebarTitle: "Particle Init"
+description: "Choose from five initialization modes — linear, random, uniform, sample, or normal — to set particle starting positions for FF-PINN agglomeration runs."
+---
+
+Before FF-PINN can simulate acoustic agglomeration, you need a starting ensemble of particles with positions, velocities, radii, and masses. The `initialize_particles()` function in `initialization/particle_initialization.py` handles all of this in one call and supports five spatial layouts so you can match your experimental setup or research question without writing custom seeding code.
+
+## Function signature
+
+```python
+from initialization.particle_initialization import initialize_particles
+
+positions, velocities, radii, mass = initialize_particles(
+    N=10000,
+    domain_size=(0.034, 0.034),
+    diameter=2e-6,
+    density=2000,
+    init_mode='linear',
+)
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `N` | `int` | `0` | Number of particles to place. |
+| `domain_size` | `(float, float)` | `(0.01, 0.01)` | Domain extents `(Lx, Ly)` in metres. The simulation default is `(0.034, 0.034)` (34 mm × 34 mm). |
+| `diameter` | `float` | `2e-6` | Nominal particle diameter in metres (2 µm). Ignored when `init_mode='linear_poly'` overrides per-particle radii. |
+| `density` | `float` | `2000` | Material density in kg/m³. |
+| `init_mode` | `str` | `'linear'` | Spatial layout algorithm — see the sections below. |
+
+### Return values
+
+| Array | Shape | Description |
+|---|---|---|
+| `positions` | `(N, 2)` | x, y coordinates in metres. |
+| `velocities` | `(N, 2)` | Initial velocities in m/s — all zeros. |
+| `radii` | `(N,)` | Per-particle radius in metres (`diameter / 2` for all monodisperse modes). |
+| `mass` | `(N,)` | Per-particle mass in kg, computed as `density × (4/3)π r³`. |
+
+## Initialization modes
+
+<AccordionGroup>
+  <Accordion title="linear — uniform spacing along x at mid-height">
+    Particles are spaced evenly from `x = 0` to `x = Lx` using `np.linspace`, all at `y = Ly / 2`. This produces a perfectly uniform 1D distribution along the centre of the domain — ideal for studying the 1D spatial convergence predicted by the ARF theory.
+
+    ```python
+    positions, velocities, radii, mass = initialize_particles(
+        N=10000,
+        domain_size=(0.034, 0.034),
+        diameter=2e-6,
+        density=2000,
+        init_mode='linear',
+    )
+    # All particles at y = 0.017 m (17 mm), x evenly in [0, 0.034] m
+    ```
+
+    <Tip>
+      Use `linear` as your baseline. Because every particle starts at the same y-coordinate, a 1D KDE along x directly reflects the ARF-driven agglomeration dynamics with no 2D spreading noise.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="random — Poisson-disk rejection sampling">
+    Particles are placed one by one using rejection sampling: each candidate position is accepted only if its centre-to-centre distance from every already-placed particle is at least **2 µm** (one diameter at the default size). This guarantees that no two particles overlap at initialisation.
+
+    The function prints progress and acceptance rate during placement, and validates the final configuration with a pairwise distance check (using `scipy.spatial.distance.pdist` when available).
+
+    ```python
+    positions, velocities, radii, mass = initialize_particles(
+        N=500,
+        domain_size=(0.034, 0.034),
+        diameter=2e-6,
+        density=2000,
+        init_mode='random',
+    )
+    ```
+
+    <Warning>
+      Rejection sampling becomes slow when `N` approaches the theoretical packing capacity of the domain. For a 34 mm × 34 mm domain with 2 µm minimum separation the crude capacity is on the order of 2.9 × 10⁸ particles. Requesting more than ~90 % of that bound will trigger a warning and may exhaust the attempt budget, raising a `RuntimeError`. For large-N runs prefer `uniform`.
+    </Warning>
+
+    <Tip>
+      Use `random` when you need a physically non-overlapping initial condition and your particle count is well below the packing limit (N ≲ 10 000 for 34 mm domains). It is the most realistic starting configuration for polydisperse studies.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="uniform — regular grid with random fill">
+    Particles are seeded onto a square grid of `ceil(√N) × ceil(√N)` points, then a random subset of size N is selected. If the grid has fewer points than N (rare for non-square N), additional particles are placed uniformly at random to fill the deficit.
+
+    ```python
+    positions, velocities, radii, mass = initialize_particles(
+        N=10000,
+        domain_size=(0.034, 0.034),
+        diameter=2e-6,
+        density=2000,
+        init_mode='uniform',
+    )
+    ```
+
+    <Tip>
+      Use `uniform` for large-N benchmarks or when you want the initial number density to be as flat as possible in 2D. It is also the fastest mode for high particle counts because it avoids the pairwise distance checks of `random`.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="sample — two vertical stacks at pressure nodes">
+    Particles are split into two equal vertical stacks: N/2 particles at `x = 8.5 mm` and N/2 at `x = 25.5 mm`, each spanning the full height of the domain at equal y-spacing. These x-positions correspond to the pressure nodes of a 10 kHz standing wave in a 34 mm domain (λ/4 and 3λ/4), making this mode useful for studying the time evolution of particle clouds that start at the expected agglomeration lines.
+
+    ```python
+    positions, velocities, radii, mass = initialize_particles(
+        N=1000,
+        domain_size=(0.034, 0.034),
+        diameter=2e-6,
+        density=2000,
+        init_mode='sample',
+    )
+    # N//2 particles at x = 8.5 mm, N - N//2 at x = 25.5 mm
+    ```
+
+    <Tip>
+      Use `sample` to test how particles already near the pressure nodes evolve. This is the fastest mode for validating that your trained models push particles *towards* the nodes rather than away from them.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="normal — truncated Gaussian along x">
+    Particle x-positions are drawn from a truncated Gaussian centred at `Lx / 2` with standard deviation `σ = Lx / 10`, using quantile inversion (Acklam's approximation to Φ⁻¹). All particles are placed at the fixed y-coordinate `y = 0.01 m`. The distribution is clipped to `[0, Lx)`.
+
+    ```python
+    positions, velocities, radii, mass = initialize_particles(
+        N=10000,
+        domain_size=(0.034, 0.034),
+        diameter=2e-6,
+        density=2000,
+        init_mode='normal',
+    )
+    # x ~ TruncatedNormal(mu=0.017, sigma=0.0034), y = 0.01 m
+    ```
+
+    <Tip>
+      Use `normal` when you want to study how a spatially concentrated initial cloud disperses or collapses under the combined ARF and Stokes forces. The narrow initial spread makes convergence patterns visually obvious in KDE plots.
+    </Tip>
+  </Accordion>
+</AccordionGroup>
+
+## Polydisperse variant: `linear_poly`
+
+In addition to the five primary modes, `init_mode='linear_poly'` is a variant of `linear` that assigns each particle a **random diameter drawn uniformly from 0.1 µm to 10 µm** (overriding the `diameter` argument). Positions are identical to `linear`. Use this mode when you are studying size-dependent drift in a polydisperse aerosol.
+
+```python
+positions, velocities, radii, mass = initialize_particles(
+    N=5000,
+    domain_size=(0.034, 0.034),
+    diameter=2e-6,   # overridden per particle
+    density=2000,
+    init_mode='linear_poly',
+)
+# radii[i] ∈ [0.05 µm, 5.0 µm], drawn uniformly
+```
+
+## Choosing the right mode
+
+| Research scenario | Recommended mode |
+|---|---|
+| Baseline 1D agglomeration benchmark | `linear` |
+| Physically non-overlapping, realistic cloud | `random` (small N) or `uniform` (large N) |
+| Validation against COMSOL node positions | `sample` |
+| Concentrated-cloud dispersion study | `normal` |
+| Polydisperse size-dependent drift | `linear_poly` |
+
+## Complete example: 10 000 particles, default 34 mm domain
+
+```python
+from initialization.particle_initialization import initialize_particles
+
+domain_size = (0.034, 0.034)  # 34 mm × 34 mm
+
+positions, velocities, radii, mass = initialize_particles(
+    N=10000,
+    domain_size=domain_size,
+    diameter=2e-6,    # 2 µm nominal
+    density=2000,     # kg/m³ — function default; override if needed
+    init_mode='linear',
+)
+
+import torch
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+positions_t  = torch.as_tensor(positions,  dtype=torch.float32, device=device)
+velocities_t = torch.as_tensor(velocities, dtype=torch.float32, device=device)
+radii_t      = torch.as_tensor(radii,      dtype=torch.float32, device=device)
+mass_t       = torch.as_tensor(mass,       dtype=torch.float32, device=device)
+```
+
+Convert to PyTorch tensors immediately after initialization — all FF-PINN force evaluations operate on `torch.float32` tensors.

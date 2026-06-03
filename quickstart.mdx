@@ -1,0 +1,273 @@
+---
+title: "FF-PINN Quickstart: Run Your First Acoustic Simulation"
+sidebarTitle: "Quickstart"
+description: "Run your first FF-PINN acoustic agglomeration simulation using the bundled demo script. Produces a density comparison plot vs. DEM and COMSOL FEM."
+---
+
+The fastest way to see FF-PINN in action is to run the bundled demo script, `review/examples/run_example.py`. It integrates 10,000 particles through 10,000 timesteps (0.01 s of physical time), then produces a density comparison plot that overlays the PINN prediction against DEM and COMSOL FEM reference curves. The whole thing — excluding training — takes about 16 seconds on a GPU or 3–5 minutes on CPU.
+
+<Tip>
+  Before running any script, make sure the repository root is on `PYTHONPATH` so that `import mechanisms` and `import initialization` resolve correctly. From the repo root: `export PYTHONPATH=$(pwd)` on Linux/macOS, or `$env:PYTHONPATH = (Get-Location).Path` in PowerShell.
+</Tip>
+
+## Run the demo
+
+<Steps>
+  <Step title="Clone and install">
+    If you have not already installed FF-PINN, clone the repository and set up the Python environment:
+
+    ```bash
+    git clone https://github.com/YinHang-jpg/FF-PINN.git
+    cd FF-PINN
+    pip install -r other_files/requirements.txt
+    pip install torch scipy tqdm
+    export PYTHONPATH=$(pwd)
+    ```
+
+    See the [installation guide](/installation) for GPU-specific instructions and the Conda alternative.
+  </Step>
+
+  <Step title="Run the demo script">
+    From the repository root, run:
+
+    ```bash
+    python review/examples/run_example.py --plot
+    ```
+
+    The `--plot` flag opens the matplotlib window in addition to saving the PNG. On a headless server, omit the flag — the PNG is always written regardless.
+
+    The script accepts three flags you can combine freely:
+
+    | Flag | Effect |
+    |---|---|
+    | `--plot` | Open the density comparison figure in a matplotlib window |
+    | `--config PATH` | Use a custom JSON config instead of the bundled `demo_input.json` |
+    | `--skip-train` | Abort immediately if `PINN/` checkpoints are missing, instead of running the training scripts |
+
+    ```bash
+    # Use the default config, no window
+    python review/examples/run_example.py
+
+    # Use a custom config and show the plot
+    python review/examples/run_example.py --config my_config.json --plot
+
+    # Fail fast if weights are missing (useful in CI)
+    python review/examples/run_example.py --skip-train
+    ```
+  </Step>
+
+  <Step title="What the script does">
+    When you run the demo, the following happens in order:
+
+    1. **Weights check** — the script scans `PINN/` for all ten required checkpoint files (five `.pth` model files and five `_normalization_params.json` files). If any are missing and you did not pass `--skip-train`, it automatically runs the five training scripts under `mechanisms/` (`ARF_PINN_x.py`, `ARF_PINN_t.py`, `STOKES_PINN_x.py`, `STOKES_PINN_t.py`, `STOKES_PINN_v.py`) from the repository root. Total first-time training takes roughly 100 seconds on a GPU.
+
+    2. **PINN simulation** — the script calls `results/PD_vs_time/PD_time.run_single_simulation` with `total_steps=10000`. This integrates 10,000 particles over 10,000 steps with `dt = 1×10⁻⁶ s`, covering 0.01 s of physical time. Particle positions are saved at `t = 0` and at the final step.
+
+    3. **Reference loading** — DEM data is loaded from `results/PD_vs_time/dem_particle_distribution_data.csv` and FEM (COMSOL) particle positions from `validation/comsol_positions.csv`. The snapshot closest to `t = 0.01 s` is selected from the FEM trajectory.
+
+    4. **KDE density comparison** — Gaussian KDE (σ = 0.3 mm, 200 grid points over [0, 34] mm) converts raw particle positions to a relative concentration change (%) for each method.
+
+    5. **Figure output** — a three-curve comparison plot is saved to `review/examples/density_comparison_t0.01s.png`.
+
+    The terminal output looks like:
+
+    ```text
+    ========================================================================
+    run_example.py | root=<repo>
+    config=review/examples/demo_input.json | simulated time = 0.0100 s
+    ========================================================================
+    [PINN] Checkpoints: PINN/ (default)
+    [PINN] run_single_simulation(steps=10000, interval=0.01)
+    [PINN] Wall time: ~16.00 s
+    [PINN] t snapshots [0.0, 0.01] → using t=0.0100 s, N=4400
+    [PINN] relative change [%]: [-19.xx, +24.xx]
+    [DEM]  relative change [%]: [-18.xx, +26.xx]
+    [FEM]  relative change [%]: [-19.xx, +25.xx]
+    [plot] review/examples/density_comparison_t0.01s.png
+    ------------------------------------------------------------------------
+    PINN vs FEM RMSE 0.60 % | MAE 0.50 %
+    Figure: review/examples/density_comparison_t0.01s.png | PINN wall 16.xx s
+    Done.
+    ```
+  </Step>
+
+  <Step title="Inspect the output figure">
+    The output file `review/examples/density_comparison_t0.01s.png` shows three overlaid curves across the 2–32 mm window of the 34 mm domain:
+
+    - **Red (PINN)** — FF-PINN predicted relative concentration change at `t = 0.01 s`
+    - **Green (DEM)** — Discrete Element Method baseline at `t = 0.01 s`
+    - **Blue (FEM)** — COMSOL Finite Element Method reference at `t = 0.01 s`
+
+    You will see two prominent density peaks at approximately x ≈ 8 mm and x ≈ 25 mm — these are the pressure nodes of the 10 kHz standing wave where particles have accumulated. All three curves should track each other closely, with PINN vs. FEM RMSE around 0.6% over the analysis window.
+  </Step>
+</Steps>
+
+## The demo configuration file
+
+The demo reads its parameters from `review/examples/demo_input.json`. You can copy this file, adjust the fields, and pass the path with `--config`:
+
+```json
+{
+  "_comment": "Minimal input configuration for review/examples/run_example.py.",
+  "_pipeline": "PINN simulation via results/PD_vs_time/PD_time.py for 0.01 s, then a single-time PINN/DEM/FEM comparison plot.",
+
+  "n_steps": 10000,
+  "dt_s": 1e-6,
+  "target_time_s": 0.01,
+
+  "_pinn_model_note": "Default: checkpoints in PINN/. Set pinn_model_base_path to a subdirectory (e.g. PINN/freq_10k) for advanced use.",
+  "pinn_model_base_path": null,
+
+  "x_window_mm": [2.0, 32.0],
+  "kde_sigma_mm": 0.3,
+  "kde_n_grid": 200,
+
+  "pinn_csv": "results/PD_vs_time/pinn_particle_positions.csv",
+  "dem_csv": "results/PD_vs_time/dem_particle_distribution_data.csv",
+  "fem_csv": "validation/comsol_positions.csv",
+  "dem_column": "relative_change_1.0e+04",
+
+  "output_figure": "density_comparison_t0.01s.png"
+}
+```
+
+Key fields explained:
+
+| Field | Description |
+|---|---|
+| `n_steps` | Number of integration timesteps. At `dt_s = 1e-6`, this gives 0.01 s of physical time. |
+| `dt_s` | Integration timestep in seconds. The default `1e-6 s` (1 µs) is the symplectic-Euler step size used throughout the manuscript. |
+| `target_time_s` | The physical time at which the snapshot is taken for the comparison plot. Must be reachable from `n_steps × dt_s`. |
+| `pinn_model_base_path` | Path to the PINN checkpoint directory, relative to the repo root. Set to `null` to use the default `PINN/` folder. Advanced users can point this to `PINN/freq_10k` or a custom directory for frequency-sweep experiments. |
+| `x_window_mm` | The x-axis range (mm) shown in the output figure. The domain is 34 mm wide; `[2.0, 32.0]` trims the edges. |
+| `kde_sigma_mm` | Gaussian kernel standard deviation (mm) for the KDE density estimate. Smaller values resolve finer spatial structure. |
+| `kde_n_grid` | Number of grid points for the KDE evaluation over [0, 34] mm. |
+| `dem_column` | Column name in the DEM CSV to use as the reference. `relative_change_1.0e+04` corresponds to 10,000 particles. |
+
+## Skipping training
+
+If the `PINN/` directory is already populated with all ten checkpoint files, the script skips training entirely. Pass `--skip-train` to make the script fail with a clear error message instead of starting a training run when weights are absent — useful in automated pipelines or CI:
+
+```bash
+python review/examples/run_example.py --skip-train
+```
+
+If checkpoints are missing, you will see:
+
+```text
+FileNotFoundError: Incomplete PINN pack under <repo>/PINN; missing e.g.
+['arf_model_x.pth', 'arf_model_x_normalization_params.json', 'arf_model_t.pth']…
+Omit --skip-train to train, or copy weights into PINN/.
+```
+
+Omit `--skip-train` and the five training scripts will run automatically before the simulation starts.
+
+## Running simulations programmatically
+
+You can drive FF-PINN directly from Python without the demo script. The snippet below mirrors what `other_files/PINN_main.py` does: it loads the five trained sub-networks, initializes 10,000 particles in a 34 mm square domain, and integrates them for 1,000 steps using the symplectic-Euler scheme.
+
+```python
+import os
+import sys
+import torch
+import numpy as np
+
+# Ensure the repository root is importable
+REPO_ROOT = "/path/to/FF-PINN"
+sys.path.insert(0, REPO_ROOT)
+os.chdir(REPO_ROOT)
+
+from initialization.particle_initialization import initialize_particles
+from initialization.sound_source_standing import frequency, sound_pressure_level
+from mechanisms.ARF_PINN_x import ARFNet as ARFNetX, Normalizer as ARFNormalizerX
+from mechanisms.ARF_PINN_t import ARFNetT, Normalizer as ARFNormalizerT
+from mechanisms.STOKES_PINN_x import StokesNetX, Normalizer as StokesNormalizerX
+from mechanisms.STOKES_PINN_t import StokesNetT, Normalizer as StokesNormalizerT
+from mechanisms.STOKES_PINN_v import StokesNetV, Normalizer as StokesNormalizerV
+
+# ── Device setup ────────────────────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ── Load the five trained sub-networks ──────────────────────────────────────
+PINN_DIR = "PINN"
+
+def load_model(model, norm, model_path, norm_path, device):
+    model.load_state_dict(
+        torch.load(model_path, map_location="cpu", weights_only=True)
+    )
+    model.eval()
+    norm.load(norm_path, device="cpu")
+    return model, norm
+
+arf_x,     arf_x_norm     = load_model(ARFNetX(fourier_features=32),          ARFNormalizerX(),  f"{PINN_DIR}/arf_model_x.pth",     f"{PINN_DIR}/arf_model_x_normalization_params.json",     device)
+arf_t,     arf_t_norm     = load_model(ARFNetT(period_seconds=1.0/frequency), ARFNormalizerT(),  f"{PINN_DIR}/arf_model_t.pth",     f"{PINN_DIR}/arf_model_t_normalization_params.json",     device)
+stokes_x,  stokes_x_norm  = load_model(StokesNetX(fourier_features=32),       StokesNormalizerX(), f"{PINN_DIR}/stokes_model_x.pth",  f"{PINN_DIR}/stokes_model_x_normalization_params.json",  device)
+stokes_t,  stokes_t_norm  = load_model(StokesNetT(period_seconds=1.0/frequency), StokesNormalizerT(), f"{PINN_DIR}/stokes_model_t.pth",  f"{PINN_DIR}/stokes_model_t_normalization_params.json",  device)
+stokes_v,  stokes_v_norm  = load_model(StokesNetV(),                           StokesNormalizerV(), f"{PINN_DIR}/stokes_model_v.pth",  f"{PINN_DIR}/stokes_model_v_normalization_params.json",  device)
+
+models = dict(arf_x=arf_x, arf_t=arf_t, stokes_x=stokes_x, stokes_t=stokes_t, stokes_v=stokes_v)
+norms  = dict(arf_x=arf_x_norm, arf_t=arf_t_norm, stokes_x=stokes_x_norm, stokes_t=stokes_t_norm, stokes_v=stokes_v_norm)
+
+# ── Initialize particles ─────────────────────────────────────────────────────
+domain_size = (0.034, 0.034)  # 34 mm × 34 mm
+positions_np, velocities_np, radii_np, mass_np = initialize_particles(
+    N=10_000, domain_size=domain_size
+)
+
+positions  = torch.as_tensor(positions_np,  dtype=torch.float32, device=device)
+velocities = torch.as_tensor(velocities_np, dtype=torch.float32, device=device)
+radii      = torch.as_tensor(radii_np,      dtype=torch.float32, device=device)
+mass       = torch.as_tensor(mass_np,       dtype=torch.float32, device=device)
+
+print(f"Initialized {positions.shape[0]:,} particles in a {domain_size[0]*1e3:.0f} mm domain")
+
+# ── Symplectic-Euler integration ─────────────────────────────────────────────
+dt          = 1e-6   # timestep [s]
+n_steps     = 1_000  # number of steps  →  1 ms of physical time
+sim_time    = 0.0
+
+for step in range(n_steps):
+    sim_time += dt
+
+    with torch.no_grad():
+        x   = positions[:, 0].cpu()
+        vx  = velocities[:, 0].cpu()
+        t_v = torch.full_like(x, sim_time)
+
+        # Normalize inputs → run sub-networks → denormalize outputs
+        x_na  = norms["arf_x"].transform({"x": x.unsqueeze(1)})["x"].squeeze()
+        t_na  = norms["arf_t"].transform({"t": t_v.unsqueeze(1)})["t"].squeeze()
+        x_ns  = norms["stokes_x"].transform({"x": x.unsqueeze(1)})["x"].squeeze()
+        t_ns  = norms["stokes_t"].transform({"t": t_v.unsqueeze(1)})["t"].squeeze()
+
+        arf_fx  = norms["arf_x"].inverse({"fx": models["arf_x"](x_na.unsqueeze(1))})["fx"].squeeze()
+        arf_ft  = norms["arf_t"].inverse({"fx": models["arf_t"](t_na.unsqueeze(1))})["fx"].squeeze()
+        s_fx    = norms["stokes_x"].inverse({"fx": models["stokes_x"](x_ns.unsqueeze(1))})["fx"].squeeze()
+        s_ft    = norms["stokes_t"].inverse({"fx": models["stokes_t"](t_ns.unsqueeze(1))})["fx"].squeeze()
+        # StokesNetV learns to reproduce vx — raw particle velocity vx is used
+        # directly in the drag formula (matching PINN_main.py)
+
+        # Physical scaling constants
+        drag_coeff    = 3.0 * np.pi * 1.8e-5 * 2e-6 / 1.083
+        spl_pressure  = 20e-6 * (10 ** (sound_pressure_level / 20))
+        A             = spl_pressure / (1.225 * 340 * 2 * np.pi * frequency)
+        stokes_amp    = 2 * np.pi * frequency * A
+
+        # Assemble total force
+        arf_total    = arf_fx * arf_ft
+        stokes_total = -drag_coeff * (vx - stokes_amp * s_ft * s_fx)
+        fx           = arf_total + stokes_total
+
+        force = torch.stack([fx, torch.zeros_like(fx)], dim=1).to(device)
+
+    # Symplectic-Euler step
+    accelerations = force / mass.unsqueeze(1)
+    velocities    = velocities + accelerations * dt
+    positions     = positions  + velocities    * dt
+
+print(f"Simulation finished. Final time: {sim_time:.4f} s")
+print(f"x range (mm): {positions[:, 0].cpu().numpy().min()*1e3:.2f} – {positions[:, 0].cpu().numpy().max()*1e3:.2f}")
+```
+
+This snippet is intentionally verbose so you can follow each step. In production you would typically import `PINN_main.run_single_simulation` or use the `PhysicalUnifiedModel` wrapper in `mechanisms/UNIFIED_PINN.py` to keep the force evaluation behind a single `forward` call.

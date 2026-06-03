@@ -1,0 +1,180 @@
+---
+title: "Install FF-PINN: Requirements and Environment Setup"
+sidebarTitle: "Installation"
+description: "Install FF-PINN with pip or conda for CPU or CUDA GPU. Requires Python 3.10+, PyTorch ≥1.13, NumPy, SciPy, and a few other packages."
+---
+
+FF-PINN is a pure-Python project with no compiled extensions of its own. You install it by cloning the repository and installing the scientific stack that its training and inference drivers depend on. The steps below take around five minutes on a modern machine with a good network connection.
+
+## Prerequisites
+
+Before you begin, make sure you have:
+
+- **Python 3.10+** — Python 3.10 was used for the manuscript benchmarks. Python 3.9–3.11 are tested; 3.12 should work but is not exercised in CI.
+- **Git** — needed to clone the repository.
+- An **NVIDIA GPU with CUDA 11.8 or 12.x** is optional but strongly recommended. On CPU, training and inference still run correctly, just more slowly (roughly 6–8× slower per step at 100k particles).
+
+<Note>
+  macOS is supported for CPU runs but has not been benchmarked. Windows 10 and Ubuntu 22.04 are both fully tested.
+</Note>
+
+## Installation
+
+<Steps>
+  <Step title="Clone the repository">
+    Open a terminal and clone FF-PINN to a local directory, then move into it. All subsequent commands assume the repository root as your working directory.
+
+    ```bash
+    git clone https://github.com/YinHang-jpg/FF-PINN.git
+    cd FF-PINN
+    ```
+  </Step>
+
+  <Step title="Create and activate a virtual environment">
+    Create an isolated environment so the FF-PINN dependencies do not interfere with other projects.
+
+    <CodeGroup>
+      ```bash Linux / macOS
+      python -m venv .venv
+      source .venv/bin/activate
+      ```
+
+      ```powershell Windows (PowerShell)
+      python -m venv .venv
+      .venv\Scripts\Activate.ps1
+      ```
+
+      ```cmd Windows (cmd)
+      python -m venv .venv
+      .venv\Scripts\activate
+      ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Install the scientific stack">
+    The `other_files/requirements.txt` file lists the core dependencies. After installing those, add PyTorch, SciPy, and tqdm separately so that you can choose the PyTorch wheel that matches your hardware.
+
+    <CodeGroup>
+      ```bash pip — CPU
+      pip install --upgrade pip
+      pip install -r other_files/requirements.txt
+      pip install torch scipy tqdm
+      ```
+
+      ```bash pip — CUDA 11.8
+      pip install --upgrade pip
+      pip install -r other_files/requirements.txt
+      pip install torch --index-url https://download.pytorch.org/whl/cu118
+      pip install scipy tqdm
+      ```
+
+      ```bash pip — CUDA 12.x
+      pip install --upgrade pip
+      pip install -r other_files/requirements.txt
+      pip install torch --index-url https://download.pytorch.org/whl/cu121
+      pip install scipy tqdm
+      ```
+
+      ```yaml conda — CPU (environment.yml)
+      name: ffpinn
+      channels:
+        - pytorch
+        - conda-forge
+        - defaults
+      dependencies:
+        - python=3.10
+        - numpy>=1.20
+        - scipy>=1.9
+        - matplotlib>=3.3
+        - numba>=0.56
+        - joblib>=1.1
+        - psutil>=5.8
+        - tqdm>=4.64
+        - pytorch>=1.13
+        - cpuonly
+        - pip
+        - pip:
+            - pytest>=6.0.0
+            - pytest-benchmark>=3.4.0
+      ```
+    </CodeGroup>
+
+    Save the YAML content above as `environment.yml` in the repository root if you want to use Conda, then run:
+
+    ```bash
+    conda env create -f environment.yml
+    conda activate ffpinn
+    ```
+
+    For a GPU Conda environment, replace `cpuonly` with `pytorch-cuda=11.8` (or the version matching your driver). Check [pytorch.org](https://pytorch.org/get-started/locally/) for the exact package name.
+
+    The full list of direct `requirements.txt` packages is:
+
+    ```text
+    numpy>=1.20.0
+    matplotlib>=3.3.0
+    numba>=0.56.0
+    joblib>=1.1.0
+    psutil>=5.8.0
+    pytest>=6.0.0
+    pytest-benchmark>=3.4.0
+    ```
+  </Step>
+
+  <Step title="Set PYTHONPATH">
+    FF-PINN's drivers import from the `mechanisms` and `initialization` sub-packages using bare module names (e.g. `import mechanisms`). Python needs to find those packages, which means the **repository root must be on `sys.path`**. The simplest way is to export `PYTHONPATH` before running any script:
+
+    <Note>
+      You must set `PYTHONPATH` every time you open a new terminal, or add the export to your shell profile (`.bashrc`, `.zshrc`, etc.) to make it permanent.
+    </Note>
+
+    <CodeGroup>
+      ```bash Linux / macOS
+      export PYTHONPATH=$(pwd)
+      ```
+
+      ```cmd Windows (cmd)
+      set PYTHONPATH=%CD%
+      ```
+
+      ```powershell Windows (PowerShell)
+      $env:PYTHONPATH = (Get-Location).Path
+      ```
+    </CodeGroup>
+
+    Alternatively, always run scripts with the repository root as your working directory — Python's default `sys.path` includes the current directory, which achieves the same effect.
+  </Step>
+
+  <Step title="Verify the installation">
+    Run the bundled demo with `--skip-train` to confirm everything is wired up correctly without triggering the training scripts. The flag tells the runner to fail fast if trained weights are missing rather than starting a long training run.
+
+    ```bash
+    python review/examples/run_example.py --skip-train
+    ```
+
+    If you already have the five checkpoint files in `PINN/` (`.pth` and `_normalization_params.json` for each sub-network), you will see the simulation run to completion and produce `review/examples/density_comparison_t0.01s.png`. If the weights are missing, the command exits with a `FileNotFoundError` listing which files to provide. See the [quickstart](/quickstart) for the full training + simulation flow.
+  </Step>
+</Steps>
+
+## Full dependency list
+
+The table below summarises every package and its minimum version:
+
+| Package | Minimum version | Purpose |
+|---|---|---|
+| `numpy` | 1.20.0 | Array operations throughout |
+| `matplotlib` | 3.3.0 | Plotting and figure output |
+| `numba` | 0.56.0 | JIT-accelerated DEM kernels |
+| `joblib` | 1.1.0 | Parallel CPU utilities |
+| `psutil` | 5.8.0 | Memory / process monitoring |
+| `torch` | 1.13 | PINN training and inference |
+| `scipy` | 1.9 | `PchipInterpolator`, KDE utilities |
+| `tqdm` | 4.64 | Progress bars during training |
+| `pytest` | 6.0.0 | Test suite |
+| `pytest-benchmark` | 3.4.0 | Per-step timing benchmarks |
+
+## Platform notes
+
+- **Windows encoding** — several scripts call `sys.stdout.reconfigure(encoding="utf-8")` at startup so that diagnostic output renders correctly. If you see garbled characters in PowerShell, run `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` before launching scripts.
+- **`torch.compile`** — if your platform ships an older version of Triton that does not support `torch.compile`, FF-PINN silently falls back to eager mode. This is the default checked into `PINN_main.py` and does not affect correctness or the benchmarked performance figures.
+- **COMSOL** — the `validation/` scripts compare against COMSOL Multiphysics 6.x FEM output. You do **not** need COMSOL to run the PINN simulation or the demo in `review/examples/`.

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "FF-PINN",
+  "theme": "luma",
+  "colors": {
+    "primary": "#d63718",
+    "light": "#d17360",
+    "dark": "#ffffff"
+  },
+  "favicon": "https://media.brand.dev/6d4774ce-91da-4504-8947-0784a4d7ff5f.jpg",
+  "logo": {
+    "light": "https://media.brand.dev/cc3d4ccd-1562-4ec6-bff8-d9810c3f36a2.svg",
+    "dark": "https://media.brand.dev/cc3d4ccd-1562-4ec6-bff8-d9810c3f36a2.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/YinHang-jpg/FF-PINN"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/overview",
+              "concepts/fourier-features",
+              "concepts/force-decomposition",
+              "concepts/sub-networks"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/training",
+              "guides/running-simulations",
+              "guides/parameter-sweeps",
+              "guides/validation"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/physics-parameters",
+              "configuration/particle-initialization",
+              "configuration/model-paths"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/python-api",
+              "reference/config-schema",
+              "reference/benchmarks",
+              "reference/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

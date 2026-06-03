@@ -1,0 +1,172 @@
+---
+title: "Configuring FF-PINN Acoustic Simulation Parameters"
+sidebarTitle: "Physics Parameters"
+description: "Configure the standing wave frequency, sound pressure level, domain size, and fluid properties that govern FF-PINN's acoustic simulation."
+---
+
+FF-PINN's acoustic environment is defined by a small set of constants spread across two source files: `initialization/sound_source_standing.py` (frequency, SPL, and the standing-wave field computation) and `mechanisms/UNIFIED_PINN.py` (fluid and force-scaling constants used by the sub-networks). These values feed directly into the standing-wave pressure field computation and into the sub-network force models, so changing them has downstream effects throughout the entire pipeline. This page documents every parameter, its default value, and how to override it safely.
+
+## Parameter reference
+
+### Acoustic globals (`sound_source_standing.py`)
+
+The two parameters below are true module-level globals that you can reassign at runtime to change the simulated acoustic condition.
+
+| Parameter | Default value | Units | Description |
+|---|---|---|---|
+| `frequency` | `10000` | Hz | Standing wave frequency. Determines wavelength λ = c₀ / f and the temporal period T = 1 / f used to normalize sub-network inputs. |
+| `sound_pressure_level` | `168.5` | dB (re 20 µPa) | Acoustic intensity expressed as SPL. Converted to pressure amplitude via `spl_to_pressure()`. |
+
+### Physical constants inside `compute_sound_field`
+
+The constants below are hardcoded inside `compute_sound_field` in `sound_source_standing.py`. They represent well-known physical properties of air at room temperature and are not exposed as module globals. Edit the function body directly only if you are simulating in a different medium.
+
+| Constant | Value | Units | Description |
+|---|---|---|---|
+| `rho_0` | `1.225` | kg/m³ | Ambient air density. Used to compute the acoustic displacement amplitude A = P / (ρ₀ c₀ ω). |
+| `c_0` | `340` | m/s | Speed of sound in air. Appears in wavenumber k = ω / c₀ and wavelength calculations. |
+| `p_0` | `101325.0` | Pa | Atmospheric (static) pressure. Enters the standing-wave pressure field formula. |
+| `gamma` | `1.4` | — | Ratio of specific heats for air. Scales the standing-wave pressure gradient. |
+
+### Force-model constants (`UNIFIED_PINN.py`)
+
+These constants are used inside `PhysicalUnifiedModel` when evaluating the Stokes drag force. They are defined at the top of `mechanisms/UNIFIED_PINN.py`.
+
+| Constant | Value | Units | Description |
+|---|---|---|---|
+| `viscosity` | `1.8e-5` | Pa·s | Reference air dynamic viscosity (module-level). The Stokes drag calculations inside `PhysicalUnifiedModel` use the local value `mu = 1.86e-5` Pa·s. |
+| `fixed_cunningham` | `1.083` | — | Module-level Cunningham slip-correction reference. `PhysicalUnifiedModel` uses the local value `cunningham = 1.0817` in drag calculations. |
+| `reference_pressure` | `20e-6` | Pa | Standard acoustic reference pressure (20 µPa). Base of the dB scale in `spl_to_pressure()`. |
+
+### Derived quantities
+
+FF-PINN computes several values automatically from the parameters above:
+
+| Derived quantity | Formula | Example (defaults) |
+|---|---|---|
+| Wavelength λ | c₀ / f | 34 mm |
+| Angular frequency ω | 2π f | 62 832 rad/s |
+| Acoustic displacement amplitude A | P / (ρ₀ c₀ ω) | ≈ 4.3 µm |
+| Nodal spacing | λ / 2 | 17 mm |
+| Pressure amplitude P | 20 µPa × 10^(SPL/20) | ≈ 168 Pa |
+
+## How to override parameters
+
+The two module-level globals `frequency` and `sound_pressure_level` can be overridden by importing the module and reassigning before calling any dependent function, or by editing the file directly when running a long batch job.
+
+### Inline override (recommended for scripts)
+
+```python
+import initialization.sound_source_standing as acoustics
+
+# Switch to 8 kHz before any other import that reads these values
+acoustics.frequency = 8000           # Hz
+acoustics.sound_pressure_level = 165.0  # dB
+
+# Now compute the new sound field
+X, Y, p = acoustics.compute_sound_field(
+    domain_size=(0.034, 0.034),
+    resolution=(200, 200),
+    spl=acoustics.sound_pressure_level,
+    frequency=acoustics.frequency,
+    sound_speed=340,
+    time=0.0,
+)
+```
+
+### Full `compute_sound_field` signature
+
+`compute_sound_field` accepts keyword arguments for every parameter so you can override without touching the globals:
+
+```python
+from initialization.sound_source_standing import compute_sound_field
+
+X, Y, p = compute_sound_field(
+    domain_size=(0.034, 0.034),   # (Lx, Ly) in metres
+    resolution=(200, 200),         # (Nx, Ny) grid points
+    spl=168.5,                     # dB
+    frequency=10000,               # Hz
+    sound_speed=340,               # m/s
+    time=0.0,                      # s
+)
+```
+
+The function returns NumPy meshgrids `X`, `Y` (metres) and the pressure field `p(x, y, t)` (Pa).
+
+### SPL-to-pressure conversion
+
+```python
+from initialization.sound_source_standing import spl_to_pressure
+
+# Default reference pressure is 20 µPa (IEC standard)
+pressure_pa = spl_to_pressure(168.5)              # → ~168 Pa
+pressure_pa = spl_to_pressure(168.5, reference_pressure=20e-6)
+```
+
+## Changing frequency or SPL
+
+Frequency and SPL are the most impactful parameters to change.
+
+<Warning>
+  Changing `frequency` or `sound_pressure_level` invalidates all pre-trained sub-network checkpoints. Each `.pth` file in a frequency pack was trained with a specific `(f, SPL)` pair baked into its Fourier feature wavenumbers and normalization statistics. After changing either value you must either switch to the corresponding pre-trained frequency pack (see [Model Paths](/configuration/model-paths)) or retrain all five sub-networks from scratch.
+</Warning>
+
+### Frequency packs
+
+FF-PINN ships pre-trained weights for four frequencies:
+
+| Pack directory | Frequency |
+|---|---|
+| `PINN/freq_8k/` | 8 kHz |
+| `PINN/freq_10k/` | 10 kHz (default) |
+| `PINN/freq_12k/` | 12 kHz |
+| `PINN/freq_16k/` | 16 kHz |
+
+When you switch frequency, point `load_individual_models()` at the matching pack and update the module global in the same script:
+
+```python
+import initialization.sound_source_standing as acoustics
+from mechanisms.UNIFIED_PINN import load_individual_models, UnifiedNormalizer, PhysicalUnifiedModel
+import os
+
+# 1. Update the acoustic globals
+acoustics.frequency = 8000
+
+# 2. Load the matching weight pack
+models = load_individual_models(device='cpu', model_base_path='PINN/freq_8k')
+
+# 3. Build the normalizer from the new pack's JSON files
+base = 'PINN/freq_8k'
+unified_norm = UnifiedNormalizer()
+unified_norm.load_from_individual_models({
+    'arf_x_norm':    os.path.join(base, 'arf_model_x_normalization_params.json'),
+    'arf_t_norm':    os.path.join(base, 'arf_model_t_normalization_params.json'),
+    'stokes_x_norm': os.path.join(base, 'stokes_model_x_normalization_params.json'),
+    'stokes_t_norm': os.path.join(base, 'stokes_model_t_normalization_params.json'),
+    'stokes_v_norm': os.path.join(base, 'stokes_model_v_normalization_params.json'),
+})
+models['unified_norm'] = unified_norm
+
+# 4. Wrap for inference
+phys_model = PhysicalUnifiedModel(models, unified_norm, device='cpu')
+```
+
+### Effect of SPL
+
+Increasing SPL raises the acoustic displacement amplitude A, which proportionally strengthens both the acoustic radiation force (ARF) and the Stokes-drag streaming term. Because the Stokes sub-networks are trained over a fixed velocity range that assumes the default SPL of 168.5 dB, operating far outside that range may push particle velocities outside the normalizer's training window and degrade accuracy. Retrain the Stokes sub-networks when deviating by more than a few dB.
+
+## Domain size
+
+The domain size only affects the `compute_sound_field` grid and the particle initialization layout. It does not change the sub-network weights because the networks are trained on x-normalized inputs that use periodic wrapping. You can therefore use a larger or smaller domain at inference time without retraining:
+
+```python
+from initialization.sound_source_standing import compute_sound_field
+from initialization.particle_initialization import initialize_particles
+
+domain = (0.068, 0.034)   # 68 mm × 34 mm (two wavelengths wide)
+
+X, Y, p = compute_sound_field(domain_size=domain, resolution=(400, 200))
+positions, velocities, radii, mass = initialize_particles(
+    N=20000, domain_size=domain, diameter=2e-6, density=2000, init_mode='uniform'
+)
+```

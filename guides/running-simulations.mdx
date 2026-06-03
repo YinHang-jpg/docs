@@ -1,0 +1,190 @@
+---
+title: "Running Acoustic Agglomeration Simulations with FF-PINN"
+sidebarTitle: "Run Simulations"
+description: "Run batch FF-PINN simulations, compare with DEM baselines, and export particle position data. Covers PINN_main.py and PINN_main_integrated.py."
+---
+
+Once your five sub-network checkpoints are in place under `PINN/`, you can advance particles through the acoustic standing-wave field using either of FF-PINN's two simulation drivers. Both drivers share the same physics — acoustic radiation force (ARF) assembled from the `ARFNet × ARFNetT` product, plus Stokes drag assembled from the three Stokes branches — and both use a Forward Euler integrator with a fixed `dt = 1 µs` timestep. The choice of driver depends on how you want to interact with the results.
+
+## Two simulation drivers
+
+| Driver | Script | Best for |
+|---|---|---|
+| **Batch mode** | `other_files/PINN_main.py` | Fastest wall-clock time; no animation overhead; 10 000-particle default |
+| **Integrated wrapper** | `other_files/PINN_main_integrated.py` | Programmatic use, position export, density-sweep integration; exposes `run_single_simulation()` |
+
+`PINN_main.py` is the right choice when you want to quickly run the default 10 kHz / 168.5 dB scenario and inspect the final scatter plot and density-change histogram. `PINN_main_integrated.py` is the right choice when you call the simulator from another script, need to save particle-position snapshots at timed intervals, or want to sweep particle density or frequency without touching the physics code.
+
+## Running a basic simulation
+
+<Note>
+Run all simulation scripts from the **repository root** directory. Sub-packages `mechanisms`, `initialization`, and the `PINN/` checkpoint folder are all resolved relative to the working directory. Set `PYTHONPATH` to the repo root before your first run:
+
+```bash
+export PYTHONPATH=$(pwd)   # Linux / macOS
+# Windows PowerShell: $env:PYTHONPATH = (Get-Location).Path
+```
+</Note>
+
+<Tabs>
+  <Tab title="CLI">
+    **Batch PINN simulation (PINN_main.py)**
+
+    ```bash
+    python other_files/PINN_main.py
+    ```
+
+    This initializes 10 000 particles uniformly across a 34 mm × 34 mm domain, loads all five sub-networks from `PINN/`, integrates 1 000 steps (`dt = 1e-6 s`, total 1 ms physical time), and opens a two-panel matplotlib figure showing initial vs. final particle scatter and the density-change histogram.
+
+    Expected console output:
+    ```text
+    === Unified PINN particle simulation (batch mode) ===
+    Initialized 10000 particles
+    Domain: 34.0 mm x 34.0 mm
+
+    Loading trained factorized models (ARF / Stokes)...
+    Factorized models loaded.
+
+    Integrating: 1000 steps, dt = 1.00e-06 s
+    Forces at t = 0:
+      ARF    range: [...]  N | mean: ...  N
+      Stokes range: [...]  N | mean: ...  N
+
+    === Done ===
+    Steps: 1000
+    Wall time: ...  s
+    Mean time per step: ...  ms
+    ```
+
+    **Integrated wrapper (PINN_main_integrated.py)**
+
+    ```bash
+    python other_files/PINN_main_integrated.py
+    ```
+
+    This runs 100 000 steps (0.1 s physical time) with 4 400 particles and prints distribution statistics on completion. It uses the `PhysicalUnifiedModel` stack from `mechanisms/UNIFIED_PINN.py` instead of calling the five sub-models directly, which offers a cleaner API for embedding in larger pipelines.
+
+    **DEM analytical baseline**
+
+    ```bash
+    python other_files/DEM_main.py
+    ```
+
+    This runs the same physics using the analytical Stokes-drag and ARF formulas (no neural network inference) for 40 000 steps with 10 000 particles. Use the DEM output as your ground-truth reference when benchmarking FF-PINN accuracy or timing.
+  </Tab>
+
+  <Tab title="Python API">
+    Use `run_single_simulation()` from `PINN_main_integrated.py` to drive the simulator programmatically:
+
+    ```python
+    import sys
+    sys.path.insert(0, ".")          # repo root on sys.path
+
+    from other_files.PINN_main_integrated import run_single_simulation
+
+    # Run 10 000 steps (0.01 s) and get the density-change profile
+    x_grid, relative_change = run_single_simulation(
+        total_steps=10_000,
+        suppress_output=False,
+        particle_density=2000,   # kg/m³
+    )
+
+    # x_grid: np.ndarray of x positions in mm, shape (500,)
+    # relative_change: % change vs. uniform baseline, shape (500,)
+
+    import matplotlib.pyplot as plt
+    plt.plot(x_grid, relative_change)
+    plt.xlabel("x (mm)")
+    plt.ylabel("Concentration change (%)")
+    plt.show()
+    ```
+
+    To also capture particle-position snapshots at 10 ms intervals:
+
+    ```python
+    x_grid, relative_change, position_data = run_single_simulation(
+        total_steps=10_000,
+        save_positions=True,
+        position_interval=0.01,   # save every 0.01 s
+        particle_density=1000,
+    )
+
+    # position_data["times"]     – np.ndarray of saved time points
+    # position_data["positions"] – list of x-position arrays (mm)
+    print("Saved snapshots at:", position_data["times"])
+    ```
+
+    To point to a different frequency pack, set the environment variable **before** importing the module:
+
+    ```python
+    import os
+    os.environ["PINN_FREQ_FOLDER"] = "freq_12k"
+
+    from other_files.PINN_main_integrated import run_single_simulation
+    x_grid, rc = run_single_simulation(total_steps=5_000)
+    ```
+  </Tab>
+</Tabs>
+
+## What the simulation outputs
+
+Both drivers compute and report:
+
+- **Particle positions** — NumPy arrays of shape `(N, 2)` in metres. Converted to mm for plotting.
+- **Velocity arrays** — shape `(N, 2)` in m/s, updated at every Forward Euler step.
+- **Force diagnostics** — ARF range, Stokes range, and mean forces at `t = 0`, printed to stdout.
+- **Timing statistics** — wall-clock time, total steps, mean milliseconds per step.
+- **Density-change histogram** — relative concentration change (%) vs. x position computed with a Gaussian KDE (`σ = 0.2 mm` in `PINN_main.py`, `σ = 0.3 mm` in `PINN_main_integrated.py`).
+
+`PINN_main_integrated.py` additionally returns `x_grid` (mm) and `relative_change` (%) from `run_single_simulation()`, and optionally exports a `position_data` dict with time-stamped x-position arrays that you can save to CSV with `save_positions_to_csv()`.
+
+## Exporting positions to CSV
+
+`PINN_main_integrated.py` includes a `save_positions_to_csv()` helper that writes position snapshots in the same format as the bundled COMSOL reference file (`validation/comsol_positions.csv`):
+
+```python
+from other_files.PINN_main_integrated import (
+    run_single_simulation,
+    save_positions_to_csv,
+)
+
+x_grid, rc, pos_data = run_single_simulation(
+    total_steps=10_000,
+    save_positions=True,
+    position_interval=0.005,
+)
+
+save_positions_to_csv(
+    pos_data,
+    output_path="my_pinn_positions.csv",
+    num_particles=500,   # save a 500-particle subset
+)
+```
+
+The CSV format is: each row is `time_s, x_p1_mm, x_p2_mm, ...` with no header, matching the layout expected by `validation/comsol_visualizer.py`.
+
+## Device selection
+
+Both drivers detect CUDA automatically:
+
+```python
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda") if use_cuda else torch.device("cpu")
+```
+
+When a GPU is available, `PINN_main.py` also sets:
+
+```python
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+```
+
+These flags improve throughput when batches are the same shape across steps, which is always true for FF-PINN's fixed-N integration loop.
+
+To force CPU execution — useful for debugging or on machines without CUDA — set the environment variable before running:
+
+```bash
+CUDA_VISIBLE_DEVICES="" python other_files/PINN_main.py
+```
+
+On the reference hardware (RTX 3060 Laptop), the default 1 000-step / 10 000-particle run completes in approximately 30 s on CPU and 5 s on GPU.

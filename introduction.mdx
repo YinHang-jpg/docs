@@ -1,0 +1,68 @@
+---
+title: "FF-PINN: Fourier-Featured PINNs for Acoustic Agglomeration"
+sidebarTitle: "Introduction"
+description: "FF-PINN accelerates acoustic particle agglomeration simulation using factorized PINNs with Fourier features — up to 27× faster than FEM with <0.01% error."
+---
+
+FF-PINN is a framework for simulating acoustic particle agglomeration — the process by which micro-scale aerosol particles cluster together under the influence of a standing acoustic wave field. Instead of evaluating expensive physics solvers at every timestep, FF-PINN trains five small neural networks once and uses them as surrogate force models during time integration, achieving the accuracy of full Finite Element and Discrete Element methods at a fraction of the computational cost.
+
+## The physical problem
+
+When you expose an aerosol of micrometer-scale particles to a standing acoustic wave, two forces dominate each particle's motion:
+
+- **Acoustic Radiation Force (SPGF)** — a time-averaged force that pushes particles toward the pressure nodes of the standing wave. It depends on the particle's position `x` and the wave's phase at time `t`, factoring as a product `F_ARFx(x) · F_ARFt(t)`.
+- **Stokes drag** — viscous coupling between the particle and the oscillating fluid. At 10 kHz and 168.5 dB, the fluid velocity at each point also factors into three components: a spatial term `N_Sx(x)`, a temporal term `N_St(t)`, and a particle-velocity term `N_Sv(v_x)`.
+
+Together these forces drive particles from their initial uniform distribution toward discrete pressure nodes separated by half a wavelength (~17 mm for a 10 kHz, 34 mm domain), producing the density peaks that define acoustic agglomeration.
+
+## Why FF-PINN
+
+Traditional approaches evaluate these forces with costly solvers at every integration timestep. COMSOL FEM assembles and solves the full acoustic field, while Discrete Element Methods (DEM) compute pairwise analytical forces for every particle. Both approaches scale poorly as particle count grows.
+
+FF-PINN replaces these per-step evaluations with **five factorized Fourier-featured neural networks** — one per force component (`ARFNetX`, `ARFNetT`, `StokesNetX`, `StokesNetT`, `StokesNetV`). Each network takes a single scalar input, uses random Fourier features tuned to the acoustic wavenumber or angular frequency to encode periodicity, and then passes through a tiny 3-layer MLP (~3,500 parameters). The total force is assembled from the sub-network outputs using the same physics factorization as the analytical model:
+
+```text
+F_total(x, v_x, t) ≈  N_ARFx(x) · N_ARFt(t)
+                    + (−c_d · N_Sv(v_x))
+                    + s · N_Sx(x) · N_St(t)
+```
+
+where `c_d` is the Cunningham-corrected Stokes drag coefficient and `s` scales the fluid velocity contribution from the sound pressure level. You train the five networks once — in roughly 100 seconds on a modern GPU — and reuse them for any simulation scenario at the same frequency and SPL.
+
+## Architecture at a glance
+
+Each sub-network shares the same Fourier-feature MLP structure:
+
+```text
+input  →  [sin(W·x), cos(W·x)]  →  Linear(64) → tanh
+                                  → Linear(32) → tanh
+                                  → Linear(1)
+```
+
+Spatial branches sample `W` from a Gaussian centred on the acoustic wavenumber `k = 2π/λ`; temporal branches centre `W` on the angular frequency `ω = 2πf`. This encoding ensures the network captures the periodicity of the wave field without needing to be shown many cycles during training. Time integration uses an explicit symplectic-Euler scheme with `dt = 1×10⁻⁶ s`.
+
+## Performance summary
+
+At 100,000 particles and a 10 kHz / 168.5 dB standing wave, FF-PINN outperforms both reference baselines across the full range of simulated physical times:
+
+| Simulated time | FF-PINN | DEM | COMSOL FEM | Speed-up vs. DEM | Speed-up vs. FEM |
+|---|---|---|---|---|---|
+| 0.005 s | 9 s | 95 s | 232 s | ~10× | ~25× |
+| 0.010 s | 17 s | 206 s | 419 s | ~12× | ~24× |
+| 0.025 s | 35 s | 490 s | 1215 s | ~14× | ~34× |
+| 0.100 s | 161 s | 2199 s | 4365 s | ~14× | ~27× |
+
+The PINN density-change distribution matches the COMSOL FEM reference with an RMS error of ~1.4% and a mean signed bias below 0.3%, measured over a 34 mm domain with 100 bins.
+
+Per-step GPU inference time scales nearly linearly with particle count — 0.55 ms at 10,000 particles and 1.7 ms at 100,000 — because the five MLPs batch efficiently on GPU while DEM and FEM are dominated by particle-level arithmetic.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="wrench" href="/installation">
+    Install FF-PINN and its dependencies on CPU or GPU.
+  </Card>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Run your first simulation in 5 minutes using the bundled demo.
+  </Card>
+</CardGroup>

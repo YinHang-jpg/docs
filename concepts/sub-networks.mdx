@@ -1,0 +1,317 @@
+---
+title: "The Five FF-PINN Sub-Networks: Architecture and Roles"
+sidebarTitle: "Sub-Networks"
+description: "Parameter counts and training targets for FF-PINN's five sub-networks: ARF spatial, ARF temporal, Stokes spatial, Stokes temporal, and Stokes velocity."
+---
+
+FF-PINN divides the total acoustic force into five independent factors, each learned by its own small network. Understanding what each sub-network takes as input, what it produces, and how many parameters it uses helps you reason about where accuracy comes from and how to extend the model to new physical regimes. This page walks through all five networks in detail, drawing directly from the source files in `mechanisms/`.
+
+## Summary table
+
+| Sub-network | Class | Input | Fourier basis | Parameters | Target function |
+|---|---|---|---|---|---|
+| **ARF spatial** | `ARFNet` | `x` (position) | `[sin(Bᵢx), cos(Bᵢx)]`, 32 pairs, `Bᵢ ~ N(0,k²)` | 6,273 | `∝ sin(kx)` |
+| **ARF temporal** | `ARFNetT` | `t` (time, normalized) | `[sin(ωt), cos(ωt)]`, 1 pair | 641 | `cos(ωt)` |
+| **Stokes spatial** | `StokesNetX` | `x` (position) | `[sin(Bᵢx), cos(Bᵢx)]`, 32 pairs, `Bᵢ ~ N(0,k²)` | 2,657 | `cos(kx)` |
+| **Stokes temporal** | `StokesNetT` | `t` (time, normalized) | `[sin(ωt), cos(ωt)]`, 1 pair | 673 | `cos(ωt)` |
+| **Stokes velocity** | `StokesNetV` | `v_x` (velocity, normalized) | none | 177 | `v_x` (identity) |
+
+All five networks together use **10,421 trainable parameters** — less than a single medium-sized dense layer in a typical deep-learning model.
+
+---
+
+## ARF spatial sub-network — `ARFNet`
+
+`ARFNet` (defined in `mechanisms/ARF_PINN_x.py`) learns the spatial envelope of the acoustic radiation force: the `sin(kx)` dependence that tells you where in the standing wave a particle feels the strongest push toward a pressure node.
+
+**Architecture:**
+
+```python
+class ARFNet(nn.Module):
+    """
+    Fourier-feature MLP: [x] -> [Fx]
+    Uses Fourier features to encode acoustic periodicity
+    """
+    def __init__(self, fourier_features=32):
+        super().__init__()
+        self.fourier_features = fourier_features
+
+        wavelength = c_0 / frequency          # ~0.034 m at 10 kHz
+        k = 2 * np.pi / wavelength            # ~1850 rad/m
+
+        # Fixed buffer: not a learned parameter
+        self.register_buffer('fourier_weights',
+                             torch.randn(1, fourier_features) * k)
+
+        self.layers = nn.Sequential(
+            nn.Linear(fourier_features * 2, 64),  # 64 → 64
+            nn.Tanh(),
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        fourier_x = self.fourier_weights * x
+        fourier_features = torch.cat(
+            [torch.sin(fourier_x), torch.cos(fourier_x)], dim=1
+        )
+        return self.layers(fourier_features)
+```
+
+**Input:** `x_norm` — position normalized to `[0, 1]` over the training window `[x_min, x_max]` (default ±25.5 mm, covering three half-wavelengths).
+
+**Output:** A normalized scalar that `UnifiedNormalizer.denormalize_arf_force` scales back to physical units using the stored `force_mu` and `force_sigma` from `PINN/arf_model_x_normalization_params.json`.
+
+**Parameter count:** `(64×64 + 64) + (64×32 + 32) + (32×1 + 1) = 4,160 + 2,080 + 33 = 6,273`.
+
+**Training:** The network is trained against `theoretical_arf(x)` evaluated at 20,000 random positions. The target loss is `1e-5` (MSE on z-scored outputs).
+
+---
+
+## ARF temporal sub-network — `ARFNetT`
+
+`ARFNetT` (defined in `mechanisms/ARF_PINN_t.py`) learns the time modulation of the ARF: `cos(ωt)`, the carrier that oscillates at the acoustic frequency. Because the target is a single pure sinusoid, the Fourier encoding uses just one `(sin, cos)` pair rather than a random bank.
+
+**Architecture:**
+
+```python
+class ARFNetT(nn.Module):
+    """
+    MLP on normalized time in [0,1]; maps to physical seconds for sin/cos(ωt)
+    """
+    def __init__(self, period_seconds: float):
+        super().__init__()
+        omega = 2 * np.pi * frequency
+        self.register_buffer('omega',
+                             torch.tensor(omega, dtype=torch.float32))
+        self.register_buffer('period_seconds',
+                             torch.tensor(period_seconds, dtype=torch.float32))
+
+        self.layers = nn.Sequential(
+            nn.Linear(2, 32),   # one sin/cos pair → 32 hidden
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, t_norm):
+        t_seconds = t_norm * self.period_seconds
+        phase = self.omega * t_seconds
+        fourier_features = torch.cat(
+            [torch.sin(phase), torch.cos(phase)], dim=1
+        )
+        return self.layers(fourier_features)
+```
+
+**Input:** `t_norm` — time normalized to `[0, 1]` over one acoustic period (100 µs at 10 kHz).
+
+**Output:** A normalized scalar representing the `cos(ωt)` time factor, denormalized at inference using `force_mu` / `force_sigma` from `PINN/arf_model_t_normalization_params.json`.
+
+**Parameter count:** `(2×32 + 32) + (32×16 + 16) + (16×1 + 1) = 96 + 528 + 17 = 641`.
+
+**Training:** Trained against `cos(ωt)` at 20,000 random time samples with target loss `1e-7`.
+
+---
+
+## Stokes spatial sub-network — `StokesNetX`
+
+`StokesNetX` (defined in `mechanisms/STOKES_PINN_x.py`) learns the spatial modulation of the acoustic fluid velocity: `cos(kx)`. This factor appears in the acoustic streaming term of the Stokes drag (`u_air(x,t) = -ωA · cos(kx) · cos(ωt)`). Unlike `ARFNet`, the architecture appends the normalized position scalar to the Fourier features before the first linear layer, giving the network a direct linear channel alongside the oscillatory encoding.
+
+**Architecture:**
+
+```python
+class StokesNetX(nn.Module):
+    """
+    Fourier MLP: [x] -> [Fx]
+    Fourier features capture acoustic periodicity
+    """
+    def __init__(self, fourier_features=32):
+        super().__init__()
+
+        wavelength = sound_speed / frequency
+        k = 2 * np.pi / wavelength
+
+        self.register_buffer('fourier_weights',
+                             torch.randn(1, fourier_features) * k)
+
+        self.layers = nn.Sequential(
+            nn.Linear(fourier_features * 2 + 1, 32),  # sin/cos + x_norm → 32
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, x):
+        fourier_x = self.fourier_weights * x
+        fourier_features = torch.cat(
+            [torch.sin(fourier_x), torch.cos(fourier_x)], dim=1
+        )
+        combined_input = torch.cat([fourier_features, x], dim=1)
+        return self.layers(combined_input)
+```
+
+**Input:** `x_norm` — position normalized to `[0, 1]`. Note that `StokesNetX` uses a separate normalization window (`stokes_x_min`, `stokes_x_max`) stored in `PINN/stokes_model_x_normalization_params.json`, independent of the ARF x window.
+
+**Output:** A normalized scalar representing the `cos(kx)` factor. The MLP input dimension is `2×32 + 1 = 65` (Fourier features plus the raw normalized position).
+
+**Parameter count:** `(65×32 + 32) + (32×16 + 16) + (16×1 + 1) = 2,112 + 528 + 17 = 2,657`.
+
+---
+
+## Stokes temporal sub-network — `StokesNetT`
+
+`StokesNetT` (defined in `mechanisms/STOKES_PINN_t.py`) mirrors `ARFNetT` for the Stokes drag time factor, learning `cos(ωt)`. Like `StokesNetX`, it appends the normalized time scalar to the Fourier pair before the first linear layer.
+
+**Architecture:**
+
+```python
+class StokesNetT(nn.Module):
+    """
+    MLP on [t_norm] -> [Fx], Fourier features for temporal periodicity
+    """
+    def __init__(self, period_seconds: float):
+        super().__init__()
+        omega = 2 * np.pi * frequency
+        self.register_buffer('omega',
+                             torch.tensor(omega, dtype=torch.float32))
+        self.register_buffer('period_seconds',
+                             torch.tensor(period_seconds, dtype=torch.float32))
+
+        self.layers = nn.Sequential(
+            nn.Linear(2 + 1, 32),   # sin/cos + t_norm → 32
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, t_norm):
+        t_seconds = t_norm * self.period_seconds
+        phase = self.omega * t_seconds
+        fourier_features = torch.cat(
+            [torch.sin(phase), torch.cos(phase)], dim=1
+        )
+        combined_input = torch.cat([fourier_features, t_norm], dim=1)
+        return self.layers(combined_input)
+```
+
+**Input:** `t_norm` — time normalized over the Stokes-specific period window (`stokes_t_min`, `stokes_t_max`), read from `PINN/stokes_model_t_normalization_params.json`.
+
+**Output:** A normalized scalar representing the temporal modulation of the acoustic air velocity.
+
+**Parameter count:** `(3×32 + 32) + (32×16 + 16) + (16×1 + 1) = 128 + 528 + 17 = 673`.
+
+---
+
+## Stokes velocity sub-network — `StokesNetV`
+
+`StokesNetV` (defined in `mechanisms/STOKES_PINN_v.py`) learns the simplest of the five targets: the particle velocity `v_x` itself. There is no physical periodicity in the velocity dependence of Stokes drag, so this network uses no Fourier features — just a plain three-layer MLP. It is included so that `PhysicalUnifiedModel` loads and evaluates all five branches uniformly; the force assembler applies the raw particle velocity `v_x` analytically rather than routing it through this network.
+
+**Architecture:**
+
+```python
+class StokesNetV(nn.Module):
+    """
+    MLP: [v_x] -> [Fx]
+    Velocity channel, no Fourier features needed
+    """
+    def __init__(self):
+        super().__init__()
+
+        self.layers = nn.Sequential(
+            nn.Linear(1, 16),   # v_x → 16
+            nn.Tanh(),
+            nn.Linear(16, 8),
+            nn.Tanh(),
+            nn.Linear(8, 1)
+        )
+
+    def forward(self, vx):
+        return self.layers(vx)
+```
+
+**Input:** `v_norm` — velocity normalized to `[0, 1]` over the training window `[-0.1, 0.1]` m/s. The normalization statistics are stored in `PINN/stokes_model_v_normalization_params.json`.
+
+**Output:** A normalized scalar representing the learned identity `v_x → v_x`. In `PhysicalUnifiedModel`, the resistive drag term applies the raw particle velocity `vx` analytically rather than routing it through this network; `StokesNetV` is trained and loaded for architectural completeness and consistency across all five branches.
+
+**Parameter count:** `(1×16 + 16) + (16×8 + 8) + (8×1 + 1) = 32 + 136 + 9 = 177`.
+
+---
+
+## Normalization and denormalization
+
+Every sub-network operates on **z-score normalized outputs**. At training time, the analytical target values are shifted by their mean and divided by their standard deviation:
+
+```python
+force_mu    = F_theory.mean()
+force_sigma = F_theory.std().clamp_min(1e-30)
+Y_theory    = (F_theory - force_mu) / force_sigma
+```
+
+At inference time, `UnifiedNormalizer.denormalize_arf_force` and `denormalize_stokes_force` reverse this transformation:
+
+```python
+def denormalize_arf_force(self, fx_norm, ft_norm):
+    fx = fx_norm * self.stats['arf_fx_sigma'] + self.stats['arf_fx_mu']
+    ft = ft_norm * self.stats['arf_ft_sigma'] + self.stats['arf_ft_mu']
+    return fx, ft
+```
+
+The mean and sigma values for each branch are persisted in the five JSON files under `PINN/`. This design means you can retrain any single sub-network and update only its JSON without changing the other four.
+
+## How `PhysicalUnifiedModel` combines the five branches
+
+`PhysicalUnifiedModel` (in `mechanisms/UNIFIED_PINN.py`) is the inference wrapper that calls all five sub-networks and assembles the total force:
+
+```python
+@torch.no_grad()
+def forward(self, x, vx, t):
+    # Normalize inputs
+    x_norm, _, t_norm = self.unified_norm.normalize_inputs(x, vx, t)
+
+    # ARF factors
+    arf_fx_norm = self.models['arf_x'](x_norm.unsqueeze(1))
+    arf_ft_norm = self.models['arf_t'](t_norm.unsqueeze(1))
+    arf_fx, arf_ft = self.unified_norm.denormalize_arf_force(
+        arf_fx_norm, arf_ft_norm
+    )
+    arf_total = arf_fx.squeeze() * arf_ft.squeeze()
+
+    # Stokes factors (separate normalization windows)
+    sx_norm, sv_norm, st_norm = self.unified_norm.normalize_inputs_stokes(
+        x, vx, t
+    )
+    stokes_fx_norm = self.models['stokes_x'](sx_norm.unsqueeze(1))
+    stokes_ft_norm = self.models['stokes_t'](st_norm.unsqueeze(1))
+    stokes_fv_norm = self.models['stokes_v'](sv_norm.unsqueeze(1))
+    stokes_fx, stokes_ft, stokes_fv = self.unified_norm.denormalize_stokes_force(
+        stokes_fx_norm, stokes_ft_norm, stokes_fv_norm
+    )
+
+    # Physical constants
+    mu = 1.86e-5          # dynamic viscosity [Pa·s]
+    cunningham = 1.0817   # Cunningham slip correction
+    diameter = 2e-6       # particle diameter [m]
+    omega = 2.0 * np.pi * self.inferred_frequency
+    drag_coeff = 3.0 * np.pi * mu * diameter / cunningham
+
+    reference_pressure = 20e-6  # Pa
+    sound_pressure = reference_pressure * (10 ** (sound_pressure_level / 20))
+    rho_0 = 1.225  # air density [kg/m^3]
+    c_0 = 340      # sound speed [m/s]
+    A = sound_pressure / (rho_0 * c_0 * omega)
+
+    # Acoustic air velocity encoded by learned spatial/temporal factors;
+    # raw particle velocity vx is used directly for the resistive term
+    u_air = -omega * A * stokes_fx.squeeze() * stokes_ft.squeeze()
+    stokes_total = -drag_coeff * (vx - u_air)
+
+    return arf_total + stokes_total   # (N,)
+```
+
+All five forward passes are independent and can be parallelized on GPU. On CPU, the combined inference for a batch of 10,000 particles typically takes under 5 ms per timestep, compared to several hundred milliseconds for the analytical DEM baseline at the same scale.
+
+For more on how the factorized forces are physically motivated, see the [Force Decomposition](/concepts/force-decomposition) page. For an explanation of the Fourier feature encoding used by the spatial and temporal branches, see the [Fourier Features](/concepts/fourier-features) page.

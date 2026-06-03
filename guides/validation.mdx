@@ -1,0 +1,105 @@
+---
+title: "Validating FF-PINN Against FEM and DEM Baselines"
+sidebarTitle: "Validation"
+description: "Compare FF-PINN simulation results against COMSOL FEM and DEM baselines using KDE density distributions and the built-in visualizer."
+---
+
+FF-PINN's accuracy is assessed by comparing the particle concentration distribution it produces against two independent reference methods: the analytical Discrete Element Method (DEM) baseline implemented in `DEM_main.py`, and a full finite-element COMSOL Multiphysics simulation exported as particle trajectory CSV files. All three methods are compared using a 1D Gaussian kernel density estimate (KDE) projected along the acoustic propagation axis (x), so that concentration peaks and troughs can be measured on a common scale.
+
+## What validation measures
+
+The validation workflow checks two things:
+
+1. **Spatial accuracy** — Does the FF-PINN density-change profile match the DEM and FEM profiles in peak location (x ≈ 8.5 mm and x ≈ 25.5 mm for the default 10 kHz field) and relative amplitude?
+2. **Speed–accuracy trade-off** — How much wall-clock time does FF-PINN save compared to DEM and COMSOL, and what error does that trade-off cost?
+
+## Running the minimal validation demo
+
+The quickest end-to-end validation run integrates 10 000 timesteps (0.01 s physical time) and then compares the resulting PINN density curve against the bundled DEM and COMSOL reference data:
+
+```bash
+python review/examples/run_example.py --plot
+```
+
+This script:
+1. Checks `PINN/` for all ten checkpoint artifacts. If any are missing it trains the five sub-networks automatically (unless you pass `--skip-train`).
+2. Calls `results/PD_vs_time/PD_time.run_single_simulation` for 10 000 steps.
+3. Loads the bundled DEM CSV and COMSOL FEM trajectories.
+4. Prints relative-concentration-change ranges and pointwise RMSE / MAE over the 2–32 mm analysis window.
+5. Saves `review/examples/density_comparison_t0.01s.png` — a three-curve overlay (FF-PINN, DEM, FEM) showing the density peaks at x ≈ 8.5 mm and x ≈ 25.5 mm.
+
+If the printed values match `review/examples/expected_output.txt` and the figure shows PINN / DEM / FEM in agreement, your installation is healthy.
+
+## Comparing against COMSOL FEM
+
+<Note>
+The COMSOL FEM comparison requires the file `validation/comsol_positions.csv`. This CSV is bundled with the repository. If you have run your own COMSOL simulation and want to compare against a custom export, replace this file with your own data in the same format: column 0 is simulation time in seconds; columns 1 onward are x-positions of individual particles in millimetres, within the 0–34 mm domain.
+</Note>
+
+Run the COMSOL density visualizer from the repository root:
+
+```bash
+python validation/comsol_visualizer.py
+```
+
+The script reads `validation/comsol_positions.csv`, applies a Gaussian KDE with `bandwidth = 0.5 mm` at each saved timestep, and writes two output figures:
+
+- `validation/comsol_density_evolution.png` — absolute particle number density vs. x at each exported time, coloured by time from blue (early) to red (late).
+- `validation/comsol_density_change.png` — relative density change (%) vs. x, referenced to the first exported timestep. This is the direct counterpart to the density-change histogram produced by `PINN_main.py`.
+
+The KDE formula used in `comsol_visualizer.py` is:
+
+```python
+def calculate_particle_density(particle_positions_mm, x_grid_mm, bandwidth=0.5):
+    density = np.zeros_like(x_grid_mm)
+    for idx, x_pos in enumerate(x_grid_mm):
+        distances = np.abs(particle_positions_mm - x_pos)
+        density[idx] = np.sum(np.exp(-distances ** 2 / (2 * bandwidth ** 2)))
+    return density
+```
+
+This is identical to the recipe used by `PINN_main.py` (with `sigma = 0.2 mm`) and `PINN_main_integrated.py` (with `sigma = 0.3 mm`), ensuring that peak heights are comparable between the three methods when you plot them on the same axis.
+
+## Running the density comparison
+
+The minimal validation demo described above already generates the three-curve comparison. The output figure is saved to `review/examples/density_comparison_t0.01s.png`. It shows three overlapping KDE curves at `t = 0.01 s`. Expected appearance:
+
+- Both DEM and FF-PINN show concentration peaks at **x ≈ 8.5 mm** and **x ≈ 25.5 mm**, coinciding with the pressure nodes of the 10 kHz standing wave in the 34 mm domain.
+- The COMSOL FEM curve is the high-fidelity reference; the FF-PINN curve should lie within the visual envelope of the FEM curve across the full domain.
+
+## Collision kernel validation
+
+The orthokinetic collision kernel extracted from particle trajectories provides a second validation metric beyond density distributions. The kernel extractor is part of the paper reproduction package:
+
+```bash
+python results/kernel/kernel_extractor.py
+```
+
+This script processes particle-position time series, computes pair-wise relative velocities, and assembles the collision kernel as a function of particle size and relative velocity. Outputs are `.npz` archives and PNG heat maps saved under `results/kernel/`. Expected wall time on CPU is approximately 5 minutes.
+
+<Note>
+`results/kernel/kernel_extractor.py` is included in the paper reproduction package documented in `review/REPRODUCIBILITY.md`. It is not part of the standard repository checkout. Consult `review/REPRODUCIBILITY.md` for instructions on obtaining the full reproduction package.
+</Note>
+
+## Accuracy and speed summary
+
+The table below is taken directly from `review/PERFORMANCE.md` and the bundled timing CSV `other_files/computation_time_comparison.csv`. All measurements use `N = 100 000` particles at 10 kHz / 168.5 dB on an Intel Core i7-12700H + NVIDIA RTX 3060 Laptop.
+
+| Method | Simulated 0.01 s | Simulated 0.05 s | Simulated 0.1 s | RMS density error vs. FEM |
+|---|---|---|---|---|
+| **FF-PINN** | 17.3 s | 82.6 s | 161.5 s | **~ 1.4 %** |
+| DEM | 206.4 s | 1 059.8 s | 2 198.7 s | — |
+| COMSOL FEM | 418.6 s | 2 452.7 s | 4 364.8 s | 0 % (reference) |
+| **PINN / DEM speed-up** | **~ 12 ×** | **~ 13 ×** | **~ 14 ×** | — |
+| **PINN / FEM speed-up** | **~ 24 ×** | **~ 30 ×** | **~ 27 ×** | — |
+
+Additional accuracy metrics from `review/PERFORMANCE.md` (Gaussian KDE comparison over the full 34 mm domain, 100 bins, `σ = 0.2 mm`):
+
+| Metric | Value |
+|---|---|
+| Max relative density change error (FF-PINN vs. COMSOL) | < 5 % |
+| RMS relative density change error | ~ 1.4 % |
+| Mean signed bias | < 0.3 % |
+| Concentration error at pressure nodes | < 0.01 % |
+
+These figures confirm that FF-PINN reproduces the COMSOL FEM density distribution with few-percent accuracy while running 13–27× faster, depending on the simulated duration and particle count.

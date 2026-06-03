@@ -1,0 +1,124 @@
+---
+title: "Random Fourier Feature Encoding in FF-PINN Networks"
+sidebarTitle: "Fourier Features"
+description: "Understand how random Fourier feature encoding eliminates spectral bias in FF-PINN, enabling accurate learning of high-frequency acoustic wave patterns."
+---
+
+If you try to train a plain multi-layer perceptron (MLP) to reproduce a function like `sin(kx)` at acoustic wavenumbers — where the spatial period is around 34 mm and the time period is 100 µs — you will find it surprisingly difficult. The problem is called **spectral bias**: standard MLPs learn low-frequency components of a target function far faster than high-frequency ones, causing them to plateau at poor accuracy for the oscillatory patterns that acoustic physics demands. FF-PINN solves this with **Random Fourier Feature (RFF)** encoding, which projects every input through a set of sinusoidal basis functions tuned to the acoustic scale before any learned weights see it.
+
+## The spectral bias problem
+
+A vanilla MLP `f(x) = W_L · σ(... · σ(W_1 x + b_1) ...)` initialized with standard schemes has an implicit frequency preference: gradients for low-frequency components are large at initialization, so those components converge first. High-frequency components — such as `sin(kx)` with `k ≈ 1850 rad/m` for a 10 kHz wave in air — converge orders of magnitude more slowly, or not at all in a reasonable number of epochs. For an acoustic simulation that must fit exactly one or two spatial periods, this bias makes plain MLPs impractical.
+
+## Solution: Random Fourier Features
+
+The fix is to **lift the input into a high-dimensional feature space** by passing it through a bank of random sinusoids before the first linear layer. For a scalar input `x`, the RFF encoding is:
+
+```
+γ(x) = [sin(B₁x), sin(B₂x), ..., sin(Bₘx),
+         cos(B₁x), cos(B₂x), ..., cos(Bₘx)]
+```
+
+where each weight `Bᵢ` is drawn independently from a Gaussian distribution centred on the physical frequency of the target:
+
+```
+Bᵢ ~ N(0, k²)     for spatial inputs   (k = 2π/λ, acoustic wavenumber)
+Bᵢ ~ N(0, ω²)     for temporal inputs  (ω = 2πf, angular frequency)
+```
+
+This encoding forces the input representation to already contain substantial energy at the correct acoustic frequency. The MLP that follows only needs to learn the amplitude and phase relationship, not reconstruct the frequency from scratch.
+
+## How FF-PINN initializes spatial Fourier features
+
+Here is the actual initialization code from `mechanisms/ARF_PINN_x.py` (the ARF spatial sub-network):
+
+```python
+class ARFNet(nn.Module):
+    """
+    Fourier-feature MLP: [x] -> [Fx]
+    Uses Fourier features to encode acoustic periodicity
+    """
+    def __init__(self, fourier_features=32):
+        super().__init__()
+        self.fourier_features = fourier_features
+
+        # Wavenumber for Fourier features
+        wavelength = c_0 / frequency  # 0.034 m at 10 kHz
+        k = 2 * np.pi / wavelength
+
+        # Random Fourier feature weights — drawn from N(0, k²)
+        self.register_buffer('fourier_weights', torch.randn(1, fourier_features) * k)
+
+        # Compact MLP receiving the 64-dimensional encoding
+        self.layers = nn.Sequential(
+            nn.Linear(fourier_features * 2, 64),  # sin/cos features
+            nn.Tanh(),
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        # Build Fourier features
+        fourier_x = self.fourier_weights * x            # (N, fourier_features)
+        fourier_features = torch.cat(
+            [torch.sin(fourier_x), torch.cos(fourier_x)], dim=1
+        )                                               # (N, 2 * fourier_features)
+        return self.layers(fourier_features)
+```
+
+Notice that `fourier_weights` is registered as a **buffer** (`register_buffer`), not a parameter. The weights are fixed at initialization and are not updated during training — they provide a deterministic, physics-informed frequency scaffold. Only the MLP weights that follow are learned.
+
+## Temporal Fourier features
+
+The temporal sub-networks (`ARF_PINN_t`, `STOKES_PINN_t`) use the same idea but encode time using the angular frequency `ω = 2πf`. Because the time input is normalized to `[0, 1]` before reaching the network, the network maps it back to physical seconds before computing the feature:
+
+```python
+class ARFNetT(nn.Module):
+    def __init__(self, period_seconds: float):
+        super().__init__()
+        omega = 2 * np.pi * frequency
+        self.register_buffer('omega', torch.tensor(omega, dtype=torch.float32))
+        self.register_buffer('period_seconds',
+                             torch.tensor(period_seconds, dtype=torch.float32))
+
+        self.layers = nn.Sequential(
+            nn.Linear(2, 32),   # one sin/cos pair
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, t_norm):
+        t_seconds = t_norm * self.period_seconds   # denormalize
+        phase = self.omega * t_seconds             # ω · t
+        fourier_features = torch.cat(
+            [torch.sin(phase), torch.cos(phase)], dim=1
+        )
+        return self.layers(fourier_features)
+```
+
+Here the temporal encoding uses a single frequency (`ω`) rather than a bank of `m` random frequencies, because the temporal target is a pure sinusoid `cos(ωt)` — a single Fourier mode that one `(sin, cos)` pair suffices to represent.
+
+## Spatial vs. temporal encoding at a glance
+
+| Branch | Input | Fourier basis | Distribution |
+|---|---|---|---|
+| ARF spatial | `x` (position) | `[sin(Bᵢx), cos(Bᵢx)]`, `m=32` | `Bᵢ ~ N(0, k²)` |
+| ARF temporal | `t` (time) | `[sin(ωt), cos(ωt)]` | fixed at `ω = 2πf` |
+| Stokes spatial | `x` (position) | `[sin(Bᵢx), cos(Bᵢx)]`, `m=32` | `Bᵢ ~ N(0, k²)` |
+| Stokes temporal | `t` (time) | `[sin(ωt), cos(ωt)]` | fixed at `ω = 2πf` |
+| Stokes velocity | `v_x` (velocity) | none — plain MLP | N/A |
+
+The velocity branch (`StokesNetV`) targets the identity function `v_x`, which has no periodicity, so no Fourier encoding is needed there.
+
+## Benefits
+
+**Accurate capture of acoustic periodicity.** Because the feature bank already encodes frequency `k` or `ω`, the MLP only needs to modulate amplitude and phase. Each spatial sub-network fits `sin(kx)` or `cos(kx)` to a relative error below 1% with fewer than 7,000 parameters.
+
+**Faster convergence.** Training with RFF typically reaches the target loss (`1e-5` for the ARF spatial branch, `1e-7` for all other branches) in a fraction of the epochs required by a plain MLP on the same problem.
+
+**Noise suppression.** Random sampling of the Fourier weights spreads representation across a range of frequencies around `k`, which reduces sensitivity to noise in your training data and makes the learned function smoother between sample points.
+
+**Generalization beyond the training window.** Because the Fourier features encode the true physical periodicity, you can rely on the network to handle positions or times outside the original training window as long as `UnifiedNormalizer` wraps your inputs into the trained interval via periodic modulo arithmetic.

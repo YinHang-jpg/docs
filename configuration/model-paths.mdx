@@ -1,0 +1,202 @@
+---
+title: "Configuring FF-PINN Model Weight Paths and Loading"
+sidebarTitle: "Model Paths"
+description: "Configure where FF-PINN looks for trained sub-network weights and normalization files. Use pre-trained frequency packs or point to your own trained models."
+---
+
+FF-PINN decomposes the combined acoustic force into five factorized sub-networks — two ARF branches (spatial and temporal) and three Stokes-drag branches (spatial, temporal, and velocity). Each sub-network has its own `.pth` checkpoint and a companion JSON normalization file. This page explains where those files live, how the loader discovers them, and how to point the pipeline at a different frequency pack or your own trained weights.
+
+<Note>
+  FF-PINN imports its modules relative to the repository root. Before running any script, make sure the repository root is on your Python path:
+
+  ```bash
+  export PYTHONPATH="/path/to/FF-PINN:$PYTHONPATH"
+  ```
+
+  Without this, imports like `from mechanisms.UNIFIED_PINN import load_individual_models` will raise a `ModuleNotFoundError`.
+</Note>
+
+## Pre-trained frequency packs
+
+FF-PINN ships four pre-trained weight packs. Each pack was trained at a fixed frequency with `sound_pressure_level = 168.5 dB` and contains exactly the ten files described in the directory structure section below.
+
+| Pack directory | Frequency | Wavelength | Nodal spacing |
+|---|---|---|---|
+| `PINN/freq_8k/` | 8 kHz | 42.5 mm | 21.25 mm |
+| `PINN/freq_10k/` | 10 kHz | 34 mm | 17 mm |
+| `PINN/freq_12k/` | 12 kHz | 28.3 mm | 14.2 mm |
+| `PINN/freq_16k/` | 16 kHz | 21.25 mm | 10.6 mm |
+
+`PINN/freq_10k/` is the default pack and matches the `frequency = 10000` global in `initialization/sound_source_standing.py`.
+
+## Directory structure inside a model pack
+
+Every model pack must contain exactly these ten files:
+
+```
+PINN/freq_10k/
+├── arf_model_x.pth                          # ARF spatial sub-network weights
+├── arf_model_t.pth                          # ARF temporal sub-network weights
+├── arf_model_x_normalization_params.json    # ARF x: x_min, x_max, force_mu, force_sigma
+├── arf_model_t_normalization_params.json    # ARF t: t_min, t_max, force_mu, force_sigma
+├── stokes_model_x.pth                       # Stokes spatial sub-network weights
+├── stokes_model_t.pth                       # Stokes temporal sub-network weights
+├── stokes_model_v.pth                       # Stokes velocity sub-network weights
+├── stokes_model_x_normalization_params.json # Stokes x: x_min, x_max, force_mu, force_sigma
+├── stokes_model_t_normalization_params.json # Stokes t: t_min, t_max, force_mu, force_sigma
+└── stokes_model_v_normalization_params.json # Stokes v: vx_min, vx_max, force_mu, force_sigma
+```
+
+If any file is missing, `load_individual_models()` prints a `[missing]` warning for that checkpoint and the subsequent inference will produce incorrect or zero forces for the affected branch.
+
+## Loading workflow
+
+<Steps>
+  <Step title="Set the acoustic globals">
+    Update `initialization/sound_source_standing.frequency` to match the pack you are loading. The loader infers the frequency from the path string (e.g. `freq_10k` → 10 000 Hz), but the module global is also used inside `PhysicalUnifiedModel` for physical constant calculations.
+
+    ```python
+    import initialization.sound_source_standing as acoustics
+    acoustics.frequency = 10000  # must match the pack
+    ```
+  </Step>
+
+  <Step title="Call load_individual_models()">
+    Pass the path to your chosen pack. The loader uses a regex on the directory name to infer frequency, loads all five `.pth` files, and returns a dict of `nn.Module` instances keyed by `'arf_x'`, `'arf_t'`, `'stokes_x'`, `'stokes_t'`, `'stokes_v'`.
+
+    ```python
+    from mechanisms.UNIFIED_PINN import load_individual_models
+
+    models = load_individual_models(
+        device='cpu',                    # or 'cuda'
+        model_base_path='PINN/freq_10k', # path to the pack directory
+    )
+    ```
+  </Step>
+
+  <Step title="Build UnifiedNormalizer">
+    `UnifiedNormalizer` aggregates the ten normalization JSON files into a single stats dict. You must call `load_from_individual_models()` with explicit paths to all five JSON files.
+
+    ```python
+    from mechanisms.UNIFIED_PINN import UnifiedNormalizer
+    import os
+
+    base = 'PINN/freq_10k'
+    unified_norm = UnifiedNormalizer()
+    unified_norm.load_from_individual_models({
+        'arf_x_norm':    os.path.join(base, 'arf_model_x_normalization_params.json'),
+        'arf_t_norm':    os.path.join(base, 'arf_model_t_normalization_params.json'),
+        'stokes_x_norm': os.path.join(base, 'stokes_model_x_normalization_params.json'),
+        'stokes_t_norm': os.path.join(base, 'stokes_model_t_normalization_params.json'),
+        'stokes_v_norm': os.path.join(base, 'stokes_model_v_normalization_params.json'),
+    })
+    models['unified_norm'] = unified_norm
+    ```
+
+    After loading, `unified_norm.stats` contains keys such as `x_min`, `x_max`, `t_min`, `t_max`, `vx_min`, `vx_max`, `arf_fx_mu`, `arf_fx_sigma`, and their Stokes counterparts. These stats govern how raw particle positions, velocities, and times are normalized before being fed to the sub-networks.
+  </Step>
+
+  <Step title="Wrap with PhysicalUnifiedModel">
+    `PhysicalUnifiedModel` is an inference-only `nn.Module` that calls all five sub-networks, applies the physical scaling, and returns the total x-direction force tensor for a batch of particles.
+
+    ```python
+    from mechanisms.UNIFIED_PINN import PhysicalUnifiedModel
+
+    phys_model = PhysicalUnifiedModel(
+        models=models,
+        unified_norm=unified_norm,
+        device='cpu',
+    )
+    # PhysicalUnifiedModel prints inferred frequency and wavelength on construction
+    ```
+
+    Call the model with 1D float32 tensors of length N:
+
+    ```python
+    import torch
+
+    x  = torch.tensor(positions[:, 0], dtype=torch.float32)   # x-coordinates [m]
+    vx = torch.tensor(velocities[:, 0], dtype=torch.float32)  # x-velocities [m/s]
+    t  = torch.full_like(x, 0.0)                              # current time [s]
+
+    forces_x = phys_model(x, vx, t)   # returns tensor of shape (N,) in Newtons
+    ```
+  </Step>
+</Steps>
+
+## Normalization internals
+
+`UnifiedNormalizer` applies two different normalization windows: one for the ARF branches and one for the Stokes branches. Both use **periodic wrapping** for x and t so that particles outside the training window are handled gracefully without clamping artefacts.
+
+```python
+# ARF normalization (periodic wrap on x and t)
+x_norm, vx_norm, t_norm = unified_norm.normalize_inputs(x, vx, t)
+
+# Stokes normalization (separate x/t windows from stokes JSON files)
+sx_norm, sv_norm, st_norm = unified_norm.normalize_inputs_stokes(x, vx, t)
+```
+
+Denormalization restores sub-network outputs to physical units:
+
+```python
+arf_fx, arf_ft = unified_norm.denormalize_arf_force(arf_fx_norm, arf_ft_norm)
+stokes_fx, stokes_ft, stokes_fv = unified_norm.denormalize_stokes_force(
+    stokes_fx_norm, stokes_ft_norm, stokes_fv_norm
+)
+```
+
+## Configuring paths via demo_input.json
+
+The `review/examples/` pipeline reads model paths from a JSON configuration file. The relevant field is `pinn_model_base_path`:
+
+```json
+{
+  "_pinn_model_note": "Set pinn_model_base_path to null to use the default PINN/ directory, or provide a path such as PINN/freq_10k for a specific frequency pack.",
+  "pinn_model_base_path": null
+}
+```
+
+Set `pinn_model_base_path` to `null` (or omit it) to use the default `PINN/` directory. Set it to a string path to use a specific frequency pack:
+
+```json
+{
+  "pinn_model_base_path": "PINN/freq_8k"
+}
+```
+
+Other pipeline fields in `demo_input.json` that interact with model loading:
+
+| Field | Default | Description |
+|---|---|---|
+| `pinn_model_base_path` | `null` | Path to model pack directory. `null` → `PINN/`. |
+| `n_steps` | `10000` | Integration steps (does not affect weight loading). |
+| `dt_s` | `1e-6` | Timestep in seconds (does not affect weight loading). |
+| `target_time_s` | `0.01` | Total simulation time in seconds. |
+| `pinn_csv` | `results/PD_vs_time/pinn_particle_positions.csv` | Output path for PINN trajectory data. |
+
+## Using your own trained weights
+
+To use weights you trained yourself, create a directory that follows the same ten-file layout as the pre-trained packs and pass its path to `load_individual_models()`:
+
+```python
+models = load_individual_models(
+    device='cuda',
+    model_base_path='my_experiments/freq_20k',
+)
+```
+
+If the directory name does not match the `freq_Nk` pattern, the loader falls back to the `frequency` global from `initialization/sound_source_standing.py`. Make sure that global is set correctly before loading:
+
+```python
+import initialization.sound_source_standing as acoustics
+acoustics.frequency = 20000  # 20 kHz — no pack name pattern to auto-detect
+
+models = load_individual_models(
+    device='cpu',
+    model_base_path='my_experiments/custom_20k',
+)
+```
+
+<Note>
+  `load_individual_models()` sets all loaded sub-networks to evaluation mode automatically. You do not need to call `.eval()` yourself, but you should wrap any inference in a `torch.no_grad()` context or use `PhysicalUnifiedModel` (which already applies `@torch.no_grad()`) to avoid unnecessary gradient tracking.
+</Note>

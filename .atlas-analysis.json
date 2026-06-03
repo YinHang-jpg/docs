@@ -1,0 +1,87 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "FF-PINN",
+  "projectDescription": "A Fourier-Featured Physics-Informed Neural Network framework for fast, accurate simulation of acoustic particle agglomeration, offering orders-of-magnitude speedup over FEM and DEM baselines.",
+  "theme": "luma",
+  "primaryColor": "#d63718",
+  "lightColor": "#d17360",
+  "darkColor": "#ffffff",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/overview",
+              "concepts/fourier-features",
+              "concepts/force-decomposition",
+              "concepts/sub-networks"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/training",
+              "guides/running-simulations",
+              "guides/parameter-sweeps",
+              "guides/validation"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/physics-parameters",
+              "configuration/particle-initialization",
+              "configuration/model-paths"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/python-api",
+              "reference/config-schema",
+              "reference/benchmarks",
+              "reference/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "5-branch factorized PINN replacing costly FEM/DEM force evaluations",
+    "Random Fourier Feature encoding tuned to acoustic wavenumber and frequency",
+    "Symplectic-Euler time integration for stable long-horizon particle tracking",
+    "CPU and CUDA GPU support with automatic device detection",
+    "Multiple particle initialization modes: linear, random, uniform, sample, normal",
+    "Pre-trained model weights for 8, 10, 12, and 16 kHz standing-wave setups",
+    "COMSOL FEM and DEM validation with <0.01% concentration error",
+    "Orthokinetic collision-kernel extraction for agglomeration rate estimation",
+    "Orders-of-magnitude runtime reduction: ~13× vs. DEM, ~27× vs. COMSOL FEM",
+    "Deterministic simulations via fixed random seeds"
+  ],
+  "publicApiSurface": [
+    "initialize_particles(N, domain_size, diameter, density, init_mode)",
+    "load_individual_models(device, model_base_path)",
+    "PhysicalUnifiedModel.__call__(x_tensor, vx_tensor, t_tensor)",
+    "compute_unified_force(positions, velocities, time, models)",
+    "compute_pressure_gradient_and_apply_arf(positions, radii, t)",
+    "run_example.py --config PATH --plot --skip-train",
+    "PINN_main.py (batch PINN simulation driver)",
+    "DEM_main.py (DEM analytical baseline driver)",
+    "PINN_preview.py (quick force preview at t=0)",
+    "ARF_PINN_x.py / ARF_PINN_t.py (ARF sub-network trainers)",
+    "STOKES_PINN_x.py / STOKES_PINN_t.py / STOKES_PINN_v.py (Stokes sub-network trainers)",
+    "demo_input.json (config schema: n_steps, dt_s, target_time_s, pinn_model_base_path, x_window_mm, kde_sigma_mm, kde_n_grid)"
+  ]
+}

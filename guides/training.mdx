@@ -1,0 +1,195 @@
+---
+title: "Training FF-PINN Sub-Networks from Scratch"
+sidebarTitle: "Training"
+description: "Train FF-PINN's five sub-networks individually or all at once. Covers training scripts, output file locations, and how to verify training quality."
+---
+
+FF-PINN decomposes acoustic particle dynamics into five independent learned components — two for the acoustic radiation force (ARF) and three for the Stokes drag — each trained on its own analytical target function. You only need to retrain when you change the acoustic frequency, sound pressure level (SPL), or simulation domain size. For the four bundled frequency packs (8 kHz, 10 kHz, 12 kHz, and 16 kHz) you can skip directly to [using pre-trained weights](#using-pre-trained-weights).
+
+## When to retrain
+
+Retrain the sub-networks whenever you change:
+
+- **Acoustic frequency** — the Fourier feature wavenumber `k = 2π/λ` and the temporal carrier frequency `ω = 2πf` are baked into each network's architecture.
+- **Sound pressure level (SPL)** — the ARF spatial branch (`ARF_PINN_x`) learns force magnitudes that scale with the pressure amplitude. A different SPL shifts the output distribution and requires retraining.
+- **Domain or velocity range** — `STOKES_PINN_v` trains on particle velocities in `[-0.1, 0.1]` m/s. Extend this window if your particles reach higher speeds.
+
+If you only change particle count, particle density, or simulation duration, the existing weights remain valid — those parameters affect the time-stepper, not the force networks.
+
+## The five sub-networks
+
+| Script | Network class | Input → Output | Target |
+|---|---|---|---|
+| `mechanisms/ARF_PINN_x.py` | `ARFNet` | `x` → `F_x` | SPGF spatial force (N) |
+| `mechanisms/ARF_PINN_t.py` | `ARFNetT` | `t` → `cos(ωt)` | ARF time modulation (dimensionless) |
+| `mechanisms/STOKES_PINN_x.py` | `StokesNetX` | `x` → `cos(kx)` | Stokes spatial factor (dimensionless) |
+| `mechanisms/STOKES_PINN_t.py` | `StokesNetT` | `t` → `cos(ωt)` | Stokes time factor (dimensionless) |
+| `mechanisms/STOKES_PINN_v.py` | `StokesNetV` | `v_x` → `v_x` | Particle velocity pass-through (m/s) |
+
+The full acoustic radiation force reconstructed at runtime is `F_ARF(x,t) = ARFNet(x) × ARFNetT(t)`, and the Stokes drag is assembled from the three Stokes branches plus the drag coefficient.
+
+## Training each sub-network individually
+
+Run each script from the **repository root** with `PYTHONPATH` set to the root. Each script trains until a target MSE loss is reached and then saves weights and a normalization JSON to `PINN/`.
+
+<Steps>
+  <Step title="Set PYTHONPATH to the repository root">
+    All sub-packages (`mechanisms`, `initialization`) use relative imports and must be importable from the root.
+
+    ```bash
+    export PYTHONPATH=$(pwd)   # Linux / macOS
+    # Windows PowerShell:
+    # $env:PYTHONPATH = (Get-Location).Path
+    ```
+  </Step>
+
+  <Step title="Train the ARF spatial branch">
+    Trains a 32-feature Fourier MLP on 20 000 samples of the SPGF force across `[-25.5, 25.5]` mm. Target loss: `1e-5`.
+
+    ```bash
+    python mechanisms/ARF_PINN_x.py
+    ```
+
+    Expected output files:
+    - `PINN/arf_model_x.pth`
+    - `PINN/arf_model_x_normalization_params.json`
+
+    The JSON stores `x_min`, `x_max`, `force_mu`, and `force_sigma` for z-score denormalization during inference.
+  </Step>
+
+  <Step title="Train the ARF temporal branch">
+    Trains on 20 000 samples of `cos(ωt)` over one acoustic period. Target loss: `1e-7`.
+
+    ```bash
+    python mechanisms/ARF_PINN_t.py
+    ```
+
+    Expected output files:
+    - `PINN/arf_model_t.pth`
+    - `PINN/arf_model_t_normalization_params.json`
+
+    The JSON stores `t_min`, `t_max`, and z-score statistics under both `time_factor_mu`/`time_factor_sigma` and the legacy aliases `force_mu`/`force_sigma` so that both the new and old loader paths work.
+  </Step>
+
+  <Step title="Train the Stokes spatial branch">
+    Trains on 20 000 samples of `cos(kx)` across `[-51, 51]` mm (three wavelengths). Target loss: `1e-7`.
+
+    ```bash
+    python mechanisms/STOKES_PINN_x.py
+    ```
+
+    Expected output files:
+    - `PINN/stokes_model_x.pth`
+    - `PINN/stokes_model_x_normalization_params.json`
+  </Step>
+
+  <Step title="Train the Stokes temporal branch">
+    Trains on 20 000 samples of `cos(ωt)` over one acoustic period. Target loss: `1e-7`.
+
+    ```bash
+    python mechanisms/STOKES_PINN_t.py
+    ```
+
+    Expected output files:
+    - `PINN/stokes_model_t.pth`
+    - `PINN/stokes_model_t_normalization_params.json`
+  </Step>
+
+  <Step title="Train the Stokes velocity branch">
+    Trains on 20 000 samples of the identity function `v_x → v_x` across `[-0.1, 0.1]` m/s. This branch learns the velocity magnitude used in the drag composition. Target loss: `1e-7`.
+
+    ```bash
+    python mechanisms/STOKES_PINN_v.py
+    ```
+
+    Expected output files:
+    - `PINN/stokes_model_v.pth`
+    - `PINN/stokes_model_v_normalization_params.json`
+  </Step>
+
+  <Step title="Verify training quality">
+    After all five networks are trained, run the preview script to compare PINN predictions against the analytical ARF at `t = 0`:
+
+    ```bash
+    python other_files/PINN_preview.py
+    ```
+
+    This loads the five saved checkpoints and plots predicted versus analytical force profiles for both the ARF and Stokes branches. The mean relative error should be well below 1% for each sub-network.
+  </Step>
+</Steps>
+
+## Training hyperparameters
+
+All five scripts share the same training recipe. To change hyperparameters, open the relevant script and edit the variables near the top of `main()`:
+
+| Parameter | Default | Location in script |
+|---|---|---|
+| Learning rate | `5e-4` | `optim.Adam(model.parameters(), lr=5e-4)` |
+| LR decay factor | `0.5` | `ReduceLROnPlateau(..., factor=0.5, ...)` |
+| Patience (epochs) | `5000` | `ReduceLROnPlateau(..., patience=5000)` |
+| Target loss | `1e-5` (ARF-x), `1e-7` (others) | `target_loss = ...` |
+| Training samples N | `20 000` | `N = 20000` |
+| Fourier features | `32` (ARF-x, Stokes-x) | `fourier_features=32` |
+| Print interval | Every 500 epochs | `print_interval = 500` |
+
+Each script prints epoch, loss, and current learning rate at every `print_interval` epochs and again when the target loss is reached. Training stops automatically when the loss drops below `target_loss`.
+
+<Warning>
+Train all five sub-networks before running any simulation. `PINN_main.py` and `PINN_main_integrated.py` both load all five checkpoint pairs at startup and exit immediately with an error if any `.pth` or `.json` file is missing under `PINN/`. There is no required ordering among the five training scripts themselves — you can train them in any sequence or in parallel.
+</Warning>
+
+## Output file layout
+
+After training, the `PINN/` directory at the repository root contains:
+
+```text
+PINN/
+├── arf_model_x.pth
+├── arf_model_x_normalization_params.json
+├── arf_model_t.pth
+├── arf_model_t_normalization_params.json
+├── stokes_model_x.pth
+├── stokes_model_x_normalization_params.json
+├── stokes_model_t.pth
+├── stokes_model_t_normalization_params.json
+├── stokes_model_v.pth
+└── stokes_model_v_normalization_params.json
+```
+
+The `.pth` files are standard PyTorch `state_dict` snapshots. The `.json` files carry the input and output normalization statistics used by each `Normalizer` class at inference time. Both files are required for each sub-network — the loader checks for the pair and returns `None` if either is missing.
+
+## Using pre-trained weights
+
+The repository ships frequency-specific weight packs for four common configurations:
+
+```text
+PINN/
+├── freq_8k/    # 8 kHz pack
+├── freq_10k/   # 10 kHz pack  (default used by PINN_main.py)
+├── freq_12k/   # 12 kHz pack
+└── freq_16k/   # 16 kHz pack
+```
+
+Each subdirectory contains the same ten files (five `.pth` + five `.json`). To use a specific pack, set the `PINN_FREQ_FOLDER` environment variable before running a simulation:
+
+```bash
+export PINN_FREQ_FOLDER=freq_12k
+python other_files/PINN_main_integrated.py
+```
+
+`PINN_main_integrated.py` reads this variable in `load_physical_unified_model()` and constructs the model base path as `PINN/freq_12k/`. When the variable is unset, the loader falls back to the root `PINN/` directory.
+
+## Expected training times
+
+On an NVIDIA RTX 3060 Laptop GPU these are the approximate wall-clock training durations from `PERFORMANCE.md`:
+
+| Sub-network | Approx. training time |
+|---|---|
+| `ARF_PINN_x` | ~ 25 s |
+| `ARF_PINN_t` | ~ 18 s |
+| `STOKES_PINN_x` | ~ 24 s |
+| `STOKES_PINN_t` | ~ 18 s |
+| `STOKES_PINN_v` | ~ 12 s |
+| **All five** | **~ 100 s** |
+
+Training falls back to CPU automatically when CUDA is unavailable. The same target loss thresholds apply; CPU training takes roughly 3–5× longer per sub-network.

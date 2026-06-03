@@ -1,0 +1,130 @@
+---
+title: "Running Frequency and SPL Parameter Sweeps"
+sidebarTitle: "Parameter Sweeps"
+description: "Sweep acoustic frequency and sound pressure level to study particle concentration patterns. Uses pre-trained FF-PINN weight packs for each frequency."
+---
+
+Parameter sweeps let you quantify how acoustic frequency and sound pressure level (SPL) together determine how far particles travel and how sharply they concentrate at pressure nodes. Because FF-PINN decouples the learned force networks from the integration loop, you can run dozens of frequency-SPL combinations rapidly by swapping pre-trained weight packs without retraining.
+
+## When to use sweeps
+
+Sweeps are most useful when you want to:
+
+- Identify the frequency that maximises agglomeration for a given particle size and density.
+- Understand the SPL threshold below which particle displacement becomes negligible.
+- Generate the displacement-vs-frequency and displacement-vs-SPL curves shown in the paper's parameter study figures.
+- Validate that FF-PINN's scaling trends match the analytical ARF theory across a range of operating points.
+
+For a single operating point (fixed frequency and SPL), running `PINN_main.py` directly is faster. Sweeps are designed for the multi-point study.
+
+## What parameters can be swept
+
+<CardGroup cols={2}>
+  <Card title="Acoustic Frequency" icon="wave-square">
+    Sweep across the four bundled frequency packs: **8 kHz**, **10 kHz**, **12 kHz**, and **16 kHz**. Each corresponds to a pre-trained set of five sub-network checkpoints under `PINN/freq_8k/`, `PINN/freq_10k/`, `PINN/freq_12k/`, and `PINN/freq_16k/`. Higher frequencies produce shorter wavelengths (λ = c₀/f) and tighter pressure-node spacing, reducing the absolute displacement per particle.
+  </Card>
+  <Card title="Sound Pressure Level (SPL)" icon="volume-high">
+    SPL controls the pressure amplitude A, which scales the ARF force quadratically and the Stokes acoustic-streaming velocity linearly. The default operating point is **168.5 dB**. Increasing SPL raises particle displacement; decreasing it reduces agglomeration rate.
+  </Card>
+  <Card title="Particle Density" icon="circle-dot">
+    Heavier particles (higher density) respond less to acoustic radiation force because the ARF acceleration scales as F/m. Sweeping density reveals the density range over which agglomeration is effective for a fixed acoustic field.
+  </Card>
+  <Card title="Particle Count" icon="layer-group">
+    Vary N to study concentration statistics with different sample sizes or to benchmark throughput at scale. FF-PINN's per-step cost is nearly independent of N up to GPU memory limits.
+  </Card>
+</CardGroup>
+
+## Running a frequency sweep
+
+The easiest way to run a frequency sweep is to call `run_single_simulation()` in a loop while setting the `PINN_FREQ_FOLDER` environment variable for each frequency. See the [programmatic sweep example](#calling-sweeps-programmatically) below for the complete pattern. If you have the `results/parameter_sweep/freq_sweep.py` sweep driver from the paper reproduction package, run it from the repository root:
+
+```bash
+python results/parameter_sweep/freq_sweep.py
+```
+
+The sweep driver loops over each available `PINN/freq_*k/` subdirectory, loads the corresponding five-model pack via the `PINN_FREQ_FOLDER` mechanism, runs a fixed-duration simulation at each frequency, and records per-frequency displacement and density-change statistics.
+
+<Note>
+Frequency-specific weight packs (`PINN/freq_8k/`, `PINN/freq_10k/`, etc.) and the `results/parameter_sweep/freq_sweep.py` driver are part of the paper reproduction package documented in `review/REPRODUCIBILITY.md`. If you only have a standard checkout, use the [programmatic approach](#calling-sweeps-programmatically) with `run_single_simulation()` instead. To add a frequency not in the bundled set, train the five sub-networks at that frequency (see the [Training guide](/guides/training)) and copy the outputs to a new `PINN/freq_Xk/` folder.
+</Note>
+
+## Running a density sweep
+
+The density sweep iterates over particle densities to show how material density affects agglomeration behaviour:
+
+```bash
+python other_files/run_density_sweep.py
+```
+
+Internally this calls `results/density_sweep/density_distribution_plot.main()`. The `PINN_DENSITY_FOLDER` environment variable lets you point to density-specific weight packs under `PINN/density/` if you have trained them:
+
+```bash
+export PINN_DENSITY_FOLDER=density_500
+python other_files/run_density_sweep.py
+```
+
+When neither `PINN_DENSITY_FOLDER` nor `PINN_FREQ_FOLDER` is set, the loader uses the default `PINN/` root directory.
+
+## Calling sweeps programmatically
+
+You can embed a frequency sweep directly in a Python script by calling `run_single_simulation()` in a loop, swapping the `PINN_FREQ_FOLDER` environment variable between iterations:
+
+```python
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from other_files.PINN_main_integrated import run_single_simulation
+
+frequencies = ["freq_8k", "freq_10k", "freq_12k", "freq_16k"]
+results = {}
+
+for freq_folder in frequencies:
+    os.environ["PINN_FREQ_FOLDER"] = freq_folder
+
+    # Re-import forces a fresh model load from the new folder
+    import importlib
+    import other_files.PINN_main_integrated as pinn_mod
+    importlib.reload(pinn_mod)
+
+    x_grid, rel_change = pinn_mod.run_single_simulation(
+        total_steps=10_000,
+        suppress_output=True,
+        particle_density=1000,
+    )
+    results[freq_folder] = (x_grid, rel_change)
+    print(f"{freq_folder}: max concentration change = {rel_change.max():.2f}%")
+
+# Plot all curves on one axis
+fig, ax = plt.subplots(figsize=(10, 5))
+for label, (xg, rc) in results.items():
+    ax.plot(xg, rc, label=label)
+ax.set_xlabel("x (mm)")
+ax.set_ylabel("Concentration change (%)")
+ax.set_title("Frequency sweep: particle density distribution")
+ax.legend()
+plt.tight_layout()
+plt.savefig("freq_sweep_result.png", dpi=200)
+```
+
+## Convergence check
+
+Before interpreting sweep results, verify that the chosen timestep `dt` produces converged trajectories. The convergence check script is included in the paper reproduction package:
+
+```bash
+python results/convergence_check/convergence_check.py
+```
+
+This script sweeps several `dt` values through `PhysicalUnifiedModel` and overlays the resulting density-change curves. If curves for `dt = 1e-6 s` and `dt = 5e-7 s` are visually indistinguishable, the default timestep is sufficient. Expected wall time on a laptop GPU is approximately 3 minutes.
+
+<Note>
+`results/convergence_check/convergence_check.py` is part of the paper reproduction package. If it is not present in your checkout, you can perform the same check manually by calling `run_single_simulation()` twice with different `dt` values compiled into a local copy of `PINN_main_integrated.py` and overlaying the returned `relative_change` arrays.
+</Note>
+
+## Key physical findings
+
+The sweep results from the bundled data confirm the following trends:
+
+- **Displacement rises with SPL** — The ARF scales with the square of pressure amplitude, so doubling the SPL (in Pa terms) quadruples the force and roughly doubles the displacement over the same integration window.
+- **Displacement decreases with frequency** — Higher acoustic frequencies concentrate the ARF into narrower spatial half-wavelengths. Particles travel shorter absolute distances before reaching a pressure node, reducing net displacement measured across the full domain.
+- **Higher-density particles respond less** — Because the ARF acceleration is F/m and the drag force also opposes motion, denser (heavier) particles reach lower asymptotic velocities under the same acoustic field. This effect is most pronounced at lower SPLs where the ARF is weaker.
+- **Concentration peaks at pressure nodes** — For a 10 kHz standing wave in a 34 mm domain (λ/2 ≈ 17 mm), particle concentration builds at x ≈ 8.5 mm and x ≈ 25.5 mm, corresponding to the pressure-node locations.

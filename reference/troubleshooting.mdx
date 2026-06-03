@@ -1,0 +1,311 @@
+---
+title: "FF-PINN Troubleshooting Guide: Common Issues and Fixes"
+sidebarTitle: "Troubleshooting"
+description: "Diagnose and fix common FF-PINN setup issues: ModuleNotFoundError, missing model weights, CUDA out-of-memory errors, and poor prediction accuracy."
+---
+
+Most FF-PINN errors fall into one of a few categories: Python path issues, missing trained weights, GPU memory limits, or a mismatch between the model pack and the acoustic parameters. Work through the relevant accordion below, then check the general debug tips at the bottom of this page.
+
+---
+
+<Accordion title="ModuleNotFoundError: No module named 'mechanisms' (or 'initialization')">
+
+FF-PINN uses relative imports that expect the repository root on `sys.path`. If you run scripts from a subdirectory, or import `mechanisms` from outside the repo, Python cannot find the package.
+
+**Fix — set `PYTHONPATH` before running any script:**
+
+```bash
+# From the repository root
+export PYTHONPATH=$(pwd)          # macOS / Linux
+set PYTHONPATH=%CD%               # Windows cmd
+$env:PYTHONPATH = (Get-Location)  # PowerShell
+
+python review/examples/run_example.py
+```
+
+Alternatively, add the repo root programmatically at the top of your own script:
+
+```python
+import sys
+import pathlib
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]  # adjust depth as needed
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mechanisms.UNIFIED_PINN import load_individual_models
+```
+
+`run_example.py` does this automatically when you call it as a script; the error appears only when you import FF-PINN modules directly.
+
+</Accordion>
+
+<Accordion title="Missing .pth files — FileNotFoundError or '[missing] ARF x weights'">
+
+`load_individual_models` prints `[missing]` for each checkpoint file it cannot find, and subsequent calls to `compute_unified_force` or `PhysicalUnifiedModel.forward` will return zeros or raise an exception.
+
+The five required `.pth` files and their companion JSON files are:
+
+```text
+PINN/arf_model_x.pth
+PINN/arf_model_x_normalization_params.json
+PINN/arf_model_t.pth
+PINN/arf_model_t_normalization_params.json
+PINN/stokes_model_x.pth
+PINN/stokes_model_x_normalization_params.json
+PINN/stokes_model_t.pth
+PINN/stokes_model_t_normalization_params.json
+PINN/stokes_model_v.pth
+PINN/stokes_model_v_normalization_params.json
+```
+
+**Option 1 — train the sub-networks automatically:**
+
+```bash
+# From the repository root; omit --skip-train to allow training
+python review/examples/run_example.py
+```
+
+`run_example.py` detects incomplete weights and runs all five training scripts in sequence (~100 s on the reference GPU). After training, all ten artifacts appear in `PINN/`.
+
+**Option 2 — train each sub-network manually:**
+
+```bash
+python mechanisms/ARF_PINN_x.py
+python mechanisms/ARF_PINN_t.py
+python mechanisms/STOKES_PINN_x.py
+python mechanisms/STOKES_PINN_t.py
+python mechanisms/STOKES_PINN_v.py
+```
+
+**Option 3 — copy a pre-trained pack:**
+
+If you have a trained pack (e.g. from a colleague or a different frequency run), copy or symlink the ten files into `PINN/`, then verify with:
+
+```bash
+ls PINN/*.pth PINN/*.json
+```
+
+</Accordion>
+
+<Accordion title="CUDA out of memory error during inference">
+
+The five sub-networks each run a forward pass over the full N-particle tensor. At N = 1 000 000 the reference RTX 3060 (6 GB) stays within VRAM limits, but lower-end GPUs may run out of memory.
+
+**Fix 1 — switch to CPU:**
+
+```python
+device = "cpu"
+models = load_individual_models(device=device, model_base_path="PINN")
+phys_model = PhysicalUnifiedModel(models, unified_norm, device=device)
+```
+
+CPU inference at N = 100 000 takes ~32 ms per step (see [Benchmarks](/reference/benchmarks)), which is still faster than DEM.
+
+**Fix 2 — reduce particle count for testing:**
+
+```python
+from initialization.particle_initialization import initialize_particles
+
+positions, velocities, radii, mass = initialize_particles(
+    N=50_000,   # reduce from 100 000
+    domain_size=(0.034, 0.034),
+)
+```
+
+**Fix 3 — enable PyTorch memory-efficient settings:**
+
+```python
+import torch
+torch.set_float32_matmul_precision("high")   # slightly lower precision, less memory
+torch.backends.cudnn.benchmark = True
+```
+
+These settings are already applied in `PINN_main.py` when CUDA is available.
+
+</Accordion>
+
+<Accordion title="Poor prediction accuracy or forces look wrong">
+
+If the PINN force predictions look orders of magnitude off, or the density distribution does not develop the expected banding pattern, the most common cause is a mismatch between the loaded model pack and the acoustic parameters encoded in the source files.
+
+**Check 1 — confirm acoustic frequency matches the model pack.**
+
+The training scripts in `mechanisms/` use `frequency` imported from `initialization/sound_source_standing.py`. If that constant has been edited since training, the trained weights no longer match the runtime field parameters.
+
+```python
+from initialization.sound_source_standing import frequency, sound_pressure_level
+print(f"Runtime frequency: {frequency} Hz")
+print(f"Runtime SPL: {sound_pressure_level} dB")
+```
+
+Compare these to the `t_max` stored in the normalization JSON (the training period is `1 / frequency`):
+
+```python
+import json
+with open("PINN/arf_model_t_normalization_params.json") as f:
+    params = json.load(f)
+trained_frequency = 1.0 / params["t_max"]
+print(f"Trained frequency: {trained_frequency:.1f} Hz")
+```
+
+If these differ, retrain the sub-networks or switch to the matching model pack directory.
+
+**Check 2 — verify all five sub-networks loaded successfully.**
+
+```python
+models = load_individual_models(device="cpu", model_base_path="PINN")
+required = ["arf_x", "arf_t", "stokes_x", "stokes_t", "stokes_v"]
+missing  = [k for k in required if k not in models]
+print("Missing:", missing)  # should be []
+```
+
+**Check 3 — run the force preview script.**
+
+```bash
+python mechanisms/PINN_preview.py
+```
+
+This script evaluates forces on a 1-D x sweep and plots them. Correct ARF output for a 10 kHz, 168.5 dB field at t = 0 should show a sinusoidal spatial pattern with half-wavelength period (~17 mm) and peak force magnitudes in the range 10⁻¹⁵ – 10⁻¹³ N for 2 µm particles.
+
+</Accordion>
+
+<Accordion title="run_example.py fails with --skip-train (missing CSV files)">
+
+When you pass `--skip-train`, the script aborts if `PINN/` is incomplete — but it also needs the pre-computed DEM and FEM CSV files to draw the comparison plot. A missing CSV raises a descriptive `FileNotFoundError`.
+
+**Missing DEM CSV** (`results/PD_vs_time/dem_particle_distribution_data.csv`):
+
+Regenerate it with:
+
+```bash
+python results/PD_vs_time/PD_vs_time_DEM.py
+```
+
+**Missing FEM CSV** (`validation/comsol_positions.csv`):
+
+This file is exported from COMSOL Multiphysics. It must be generated from the COMSOL model included in `validation/` and then placed at the expected path. Refer to the instructions in `validation/README.md`.
+
+**Alternative — skip the comparison and run PINN-only:**
+
+Edit your config to point `dem_csv` and `fem_csv` at placeholder files, or modify `run_example.py` to skip the DEM/FEM loading block for a PINN-only density plot.
+
+</Accordion>
+
+<Accordion title="Numba JIT compilation is very slow on the first run">
+
+The DEM analytical baseline (`other_files/DEM_main.py`) uses a Numba-jitted force kernel. On the very first call after a clean Python startup, Numba compiles the kernel from Python bytecode to native code. This can take 10–30 seconds and is completely normal.
+
+Subsequent runs in the same process, or any later process that hits the same kernel signature, use the on-disk cache and start almost instantly.
+
+If you are timing DEM for benchmarking purposes, always discard the first timing sample (one warm-up step is sufficient). The CSV files in `other_files/` were recorded with a warm cache.
+
+You can pre-warm the JIT cache with a single cheap call before starting the timed region:
+
+```python
+import numpy as np
+from other_files.DEM_main import compute_dem_forces  # adjust import path
+
+# One warm-up call with tiny N
+dummy_pos = np.zeros((10, 2))
+dummy_rad = np.ones(10) * 1e-6
+compute_dem_forces(dummy_pos, dummy_rad, time=0.0)
+
+# Now start your timer
+import time
+t0 = time.perf_counter()
+# ... your benchmark loop ...
+```
+
+</Accordion>
+
+<Accordion title="Demo plot looks wrong (flat line or unexpected shape)">
+
+The `run_example.py` comparison plot shows relative concentration change (%) as a function of x position. Common reasons it looks wrong:
+
+**Flat line at zero:** the PINN simulation ran but the snapshot at `target_time_s` was not reached. Check that `n_steps × dt_s >= target_time_s`. For `n_steps=10000` and `dt_s=1e-6` the maximum simulated time is exactly 0.01 s.
+
+**Banding pattern in the wrong locations:** the DEM curve is plotted mirror-flipped relative to PINN and FEM in the default script to match the coordinate convention in the reference CSV. If you supply your own `dem_csv`, you may need to adjust the `interp1d` mirror transform inside `run_example.py`.
+
+**Very wide or very narrow peaks:** the KDE bandwidth `kde_sigma_mm` is the dominant smoothing factor. If peaks look too sharp, increase it (try 0.5 mm); if features are blurred together, decrease it (try 0.15 mm).
+
+**Particle count mismatch warning:** if your PINN simulation uses a different N than the `dem_column` in the DEM CSV, the curves will not agree. Set `dem_column` to a column that matches your N, or regenerate the DEM CSV at the correct particle count.
+
+</Accordion>
+
+<Accordion title="Training diverges or loss does not decrease">
+
+The five training scripts each use Adam with a learning rate of 3 × 10⁻³ and a cosine or step LR schedule. Divergence is rare but can occur if the analytical target function has outliers or if the normalization parameters are computed over a narrow range that does not cover the training distribution.
+
+**Step 1 — verify that your `sound_pressure_level` and `frequency` are physically reasonable.**
+
+Training targets are computed analytically from these two constants. Values outside the physical range the networks were designed for (SPL ≈ 140–175 dB, f ≈ 5–40 kHz) may produce targets with large dynamic range that Adam cannot handle at the default learning rate.
+
+**Step 2 — reduce the learning rate.**
+
+In the relevant `mechanisms/*_PINN_*.py` script, find the optimizer definition and lower the learning rate:
+
+```python
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  # was 3e-3
+```
+
+**Step 3 — increase the number of training samples.**
+
+The default sample counts (10 000–20 000) are sufficient for the nominal 10 kHz case. If you train at a very different frequency where the spatial period is much shorter or longer, increase samples proportionally.
+
+**Step 4 — check for NaNs in the normalization stats.**
+
+```python
+import json
+with open("PINN/arf_model_x_normalization_params.json") as f:
+    params = json.load(f)
+print(params)
+```
+
+If `force_sigma` is zero or NaN, the training target had no variance (all zeros), which typically means `spl_to_pressure` returned zero. Check that `sound_pressure_level` is set correctly in `initialization/sound_source_standing.py`.
+
+</Accordion>
+
+---
+
+## General debug tips
+
+**Check GPU availability before loading models:**
+
+```python
+import torch
+print(torch.cuda.is_available())          # True if CUDA is usable
+print(torch.cuda.get_device_name(0))      # prints GPU name, e.g. "NVIDIA RTX 3060"
+print(torch.cuda.memory_allocated() / 1e9, "GB in use")
+```
+
+**Verify model paths exist before calling `load_individual_models`:**
+
+```python
+import os
+
+base = "PINN"
+artifacts = [
+    "arf_model_x.pth", "arf_model_x_normalization_params.json",
+    "arf_model_t.pth", "arf_model_t_normalization_params.json",
+    "stokes_model_x.pth", "stokes_model_x_normalization_params.json",
+    "stokes_model_t.pth", "stokes_model_t_normalization_params.json",
+    "stokes_model_v.pth", "stokes_model_v_normalization_params.json",
+]
+for a in artifacts:
+    path = os.path.join(base, a)
+    status = "OK" if os.path.isfile(path) else "MISSING"
+    print(f"[{status}] {path}")
+```
+
+**Run the force preview sanity check:**
+
+```bash
+python mechanisms/PINN_preview.py
+```
+
+This evaluates `PhysicalUnifiedModel` on a dense 1-D grid and plots ARF, Stokes drag, and the total force vs. x. If all five weights are present and correct, you should see a smooth sinusoidal ARF curve and a small, near-zero Stokes contribution at v = 0.
+
+**Enable verbose checkpoint loading:**
+
+`load_individual_models` already prints `[ok]` or `[missing]` for each of the ten artifacts. Read this output carefully before reporting unexpected forces — a silent `[missing]` is the most common root cause of prediction problems.

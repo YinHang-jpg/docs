@@ -1,0 +1,141 @@
+---
+title: "FF-PINN Performance Benchmarks: Runtime vs. DEM and FEM"
+sidebarTitle: "Benchmarks"
+description: "Measured wall-clock runtime and accuracy comparisons between FF-PINN, DEM, and COMSOL FEM across particle counts and simulated timescales."
+---
+
+FF-PINN replaces the per-step force evaluation in a particle-tracing simulation with five small Fourier-featured neural networks. The result is a significant reduction in wall-clock time without meaningful loss of accuracy compared to analytical Discrete Element Method (DEM) baselines and full COMSOL FEM solutions. This page summarizes the measured numbers from `review/PERFORMANCE.md` and explains how to reproduce them.
+
+---
+
+## Hardware and software environment
+
+<Note>
+  All timings below were recorded on a single workstation. Your hardware will produce different absolute numbers, but the relative speedups should be representative for any modern laptop or desktop with a discrete GPU.
+</Note>
+
+| Resource | Value |
+|---|---|
+| CPU | Intel Core i7-12700H (14 cores / 20 threads, 2.3–4.7 GHz) |
+| GPU | NVIDIA RTX 3060 Laptop, 6 GB VRAM, CUDA 11.8 |
+| RAM | 32 GB DDR5 |
+| OS | Windows 10 (build 19045); cross-checked on Ubuntu 22.04 LTS |
+| Python | 3.10.12 |
+| PyTorch | 2.1.0 + cu118 (GPU) / 2.1.0 CPU fallback |
+| COMSOL | 6.1, Acoustic–Particle Tracing interface |
+
+CPU-only timings are included so you can cross-check relative ordering without a GPU. PINN inference accelerates further on GPU compared to the CPU numbers shown below.
+
+---
+
+## Training cost (one-off)
+
+Each of the five sub-networks is trained once and reused at inference. Training requires only a few minutes on the reference GPU and does not need to be repeated unless you change the acoustic frequency or SPL.
+
+| Sub-network | Training samples | Optimizer | Epochs | Training time |
+|---|---|---|---|---|
+| `ARFNetX` | 20 000 | Adam (lr = 3 × 10⁻³) | 4 000 | ~25 s |
+| `ARFNetT` | 10 000 | Adam (lr = 3 × 10⁻³) | 4 000 | ~18 s |
+| `StokesNetX` | 20 000 | Adam (lr = 3 × 10⁻³) | 4 000 | ~24 s |
+| `StokesNetT` | 10 000 | Adam (lr = 3 × 10⁻³) | 4 000 | ~18 s |
+| `StokesNetV` | 10 000 | Adam (lr = 3 × 10⁻³) | 3 000 | ~12 s |
+| **Total** | | | | **~100 s** |
+
+Single-pass loss for each sub-network on its analytical target is < 1 × 10⁻⁴ (z-score units), corresponding to a relative error well below 1% across the training window.
+
+---
+
+## Per-step inference cost
+
+The table below shows the wall-clock cost of a single force-evaluation step (all N particles, one time instant) as a function of particle count.
+
+| Particle count N | PINN per-step (GPU) | PINN per-step (CPU) | Analytical DEM (CPU) |
+|---|---|---|---|
+| 1 000 | 0.40 ms | 0.9 ms | 0.6 ms |
+| 10 000 | 0.55 ms | 4.2 ms | 5.0 ms |
+| 100 000 | 1.7 ms | 32 ms | 47 ms |
+| 1 000 000 | 14 ms | 290 ms | 540 ms |
+
+PINN per-step time on GPU scales near-linearly with N and stays well below the analytical DEM cost for N ≥ 10 000. Memory consumption remains under 6 GB VRAM up to N = 1 000 000 on the reference GPU.
+
+---
+
+## Whole-simulation comparison (fixed N = 100 000)
+
+The following timings are taken from `other_files/computation_time_comparison.csv` at a fixed particle count of 100 000 and varying simulated physical time, at 10 kHz / 168.5 dB SPL.
+
+| Simulated time [s] | PINN [s] | DEM [s] | COMSOL FEM [s] | PINN vs. DEM | PINN vs. FEM |
+|---|---|---|---|---|---|
+| 0.005 | 9.18 | 94.83 | 231.84 | **10.3 ×** faster | **25.3 ×** faster |
+| 0.010 | 17.31 | 206.35 | 418.62 | **11.9 ×** faster | **24.2 ×** faster |
+| 0.025 | 35.46 | 489.73 | 1 214.83 | **13.8 ×** faster | **34.3 ×** faster |
+| 0.050 | 82.57 | 1 059.83 | 2 452.68 | **12.8 ×** faster | **29.7 ×** faster |
+| 0.100 | 161.48 | 2 198.73 | 4 364.82 | **13.6 ×** faster | **27.0 ×** faster |
+
+**Summary:** across all tested durations, FF-PINN runs approximately **13 × faster than the DEM baseline** and **~27 × faster than COMSOL FEM** at N = 100 000.
+
+---
+
+## Particle-count scaling (fixed simulated time = 0.05 s)
+
+The data below are from `other_files/computation_time_comparision_particle.csv`. Simulated duration is fixed at 0.05 s while N sweeps from 100 000 to 1 000 000.
+
+| N [particles] | PINN [s] | DEM [s] | COMSOL FEM [s] | PINN vs. DEM | PINN vs. FEM |
+|---|---|---|---|---|---|
+| 100 000 | 28.05 | 59.20 | 131.84 | **2.1 ×** faster | **4.7 ×** faster |
+| 200 000 | 51.58 | 116.44 | 247.21 | **2.3 ×** faster | **4.8 ×** faster |
+| 500 000 | 123.62 | 329.02 | 703.67 | **2.7 ×** faster | **5.7 ×** faster |
+| 1 000 000 | 243.55 | 682.37 | 1 498.62 | **2.8 ×** faster | **6.2 ×** faster |
+
+The speedup grows with N because PINN forward passes batch efficiently on GPU while DEM and COMSOL are dominated by per-particle arithmetic and mesh-assembly overhead, respectively.
+
+---
+
+## Accuracy vs. COMSOL FEM reference
+
+Density-change distributions are compared against COMSOL output using a Gaussian KDE projection along x with σ = 0.2 mm over the full 34 mm domain (100 bins).
+
+| Metric | Value |
+|---|---|
+| Maximum relative density-change error (PINN vs. COMSOL) | **< 5 %** |
+| RMS relative density-change error | **~1.4 %** |
+| Mean signed bias | **< 0.3 %** |
+
+For the roughly 27 × speed-up at N = 100 000, FF-PINN incurs only a few-percent error in bin-averaged density change — the full trade-off analysis is discussed in the paper.
+
+---
+
+## Caveats
+
+- COMSOL timings include FEM mesh assembly and solver setup but exclude licence-server handshake. They were recorded on the same workstation; cluster runs may differ.
+- DEM timings use a Numba-jitted force kernel where Numba is available; the CSV numbers reflect a warm JIT cache. The first DEM run on a cold cache will be slower.
+- PINN inference benefits from `torch.set_float32_matmul_precision('high')` and `torch.backends.cudnn.benchmark = True`, both of which are set automatically in `PINN_main.py`.
+
+---
+
+## Reproducing these numbers
+
+### Whole-simulation comparison (vary simulated time)
+
+```bash
+python other_files/plot_time_comparison.py \
+    --csv other_files/computation_time_comparison.csv
+```
+
+### Particle-count scaling
+
+```bash
+python other_files/plot_time_comparison.py \
+    --csv other_files/computation_time_comparision_particle.csv \
+    --xkey particle_count
+```
+
+### Per-step micro-benchmark
+
+```bash
+python review/examples/run_example.py --benchmark
+```
+
+This prints mean and standard deviation per-step inference time over 100 steps using the configuration in `review/examples/demo_input.json`.
+
+For the raw CSV data used in both plots, see `other_files/computation_time_comparison.csv` and `other_files/computation_time_comparision_particle.csv` in the repository.

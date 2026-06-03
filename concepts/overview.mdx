@@ -1,0 +1,84 @@
+---
+title: "How FF-PINN Simulates Acoustic Particle Agglomeration"
+sidebarTitle: "Overview"
+description: "Learn how FF-PINN replaces costly FEM and DEM force evaluations with a factorized PINN surrogate trained on acoustic radiation force and Stokes drag."
+---
+
+When you expose an aerosol — a cloud of micrometer-scale particles suspended in air — to a standing acoustic wave, the particles experience two forces that drive them toward the pressure nodes of the wave: the **acoustic radiation force (ARF)**, which pushes particles along the pressure gradient, and **Stokes drag**, which couples each particle's motion to the oscillating air. Over many acoustic cycles the particles cluster at the nodal planes and collide, a process called **acoustic agglomeration**. Simulating this process accurately requires evaluating both forces for every particle at every timestep, and when you have thousands of particles and timesteps spanning milliseconds that computation becomes prohibitively expensive with classical numerical methods.
+
+## The physical setting
+
+FF-PINN models a 1-D standing plane wave along the x-axis. The acoustic source parameters come from `initialization/sound_source_standing.py`:
+
+```python
+frequency = 10000        # Hz  (10 kHz default; can be swept)
+sound_pressure_level = 168.5  # dB SPL
+```
+
+The standing wave produces a pressure field
+
+```
+p(x, t) = (4π A p₀ γ / λ) · sin(kx) · cos(ωt)
+```
+
+where `k = 2π/λ` is the acoustic wavenumber, `ω = 2πf` the angular frequency, and `A` is the displacement amplitude derived from the SPL. Particles of diameter 2 µm and density 1000 kg/m³ are initialized across one or more half-wavelengths and time-marched under the combined ARF and Stokes force.
+
+## The simulation challenge
+
+The classical (DEM-style) approach evaluates the **analytical ARF formula** — a pressure-difference calculation across opposite faces of each particle — at every timestep. For a simulation with 10,000 particles and `dt = 1 µs` running for 100 ms, that means 10⁹ force evaluations. Additionally, each force evaluation depends on three inputs `(x, v_x, t)` simultaneously, making it expensive to cache or vectorize without approximation.
+
+## FF-PINN's approach: train once, infer fast
+
+FF-PINN replaces both the ARF lookup and the Stokes drag computation with **five lightweight neural networks** that you train once and then use as fast surrogates at inference time. The key insight is that both forces are **separable**: the ARF factors into a spatial component and a temporal component, and the Stokes drag splits into spatial, temporal, and velocity components. Each component is a smooth, periodic function of a single scalar input — exactly what a small MLP with Fourier feature encoding can fit to machine precision.
+
+Training produces five checkpoint files stored in `PINN/`:
+
+| Checkpoint | Target function |
+|---|---|
+| `arf_model_x.pth` | ARF spatial factor `∝ sin(kx)` |
+| `arf_model_t.pth` | ARF time modulation `cos(ωt)` |
+| `stokes_model_x.pth` | Stokes air-velocity x-factor `cos(kx)` |
+| `stokes_model_t.pth` | Stokes air-velocity t-factor `cos(ωt)` |
+| `stokes_model_v.pth` | Stokes drag velocity factor `v_x` |
+
+## The total force formula
+
+At each timestep `n`, `PhysicalUnifiedModel` combines the five sub-network outputs into a single total force per particle:
+
+```
+F_total(x, v_x, t) = F_ARF(x, t) + F_Stokes(x, v_x, t)
+
+F_ARF(x, t)          = N_ARFx(x)  ×  N_ARFt(t)
+
+F_Stokes(x, v_x, t)  = −c_d · v_x
+                       + s   · N_Sx(x) · N_St(t)
+```
+
+where:
+
+- `c_d = 3π μ d_p / C_c` is the Cunningham-corrected Stokes drag coefficient
+- `s = c_d · ω · A` scales the acoustic streaming term
+- `N_ARFx`, `N_ARFt`, `N_Sx`, `N_St` are four of the five trained sub-networks; a fifth network `N_Sv` is trained as a velocity-identity surrogate but the force assembler applies the particle velocity `v_x` analytically
+
+You can inspect this composition directly in `mechanisms/UNIFIED_PINN.py` in the `PhysicalUnifiedModel.forward` method.
+
+## Symplectic-Euler time integration
+
+The time integrator uses an explicit **symplectic-Euler** scheme with a fixed step `dt = 1e-6 s`. Velocity is updated before position, which conserves energy better than the standard forward-Euler method at the same cost:
+
+```python
+dt = 1e-6  # s
+
+# Each timestep:
+F_n     = F(x_n, v_n, t_n)         # five sub-network forward pass
+v_{n+1} = v_n + (F_n / m) · dt     # velocity updated first
+x_{n+1} = x_n + v_{n+1} · dt       # position uses new velocity
+```
+
+This integration loop is implemented identically in both the PINN driver (`other_files/PINN_main.py`) and the analytical DEM baseline (`other_files/DEM_main.py`), so any trajectory difference between them reflects only the surrogate force accuracy — not an integration artefact.
+
+## What to read next
+
+- [Fourier Features](/concepts/fourier-features) — how random Fourier feature encoding eliminates spectral bias so each sub-network can fit high-frequency acoustic patterns
+- [Force Decomposition](/concepts/force-decomposition) — the physical and mathematical justification for factorizing ARF and Stokes drag into one-input branches
+- [Sub-Networks](/concepts/sub-networks) — the architecture, parameter counts, and input/output conventions for all five trained networks

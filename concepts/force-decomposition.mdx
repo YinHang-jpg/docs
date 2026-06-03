@@ -1,0 +1,167 @@
+---
+title: "Acoustic Radiation Force and Stokes Drag Decomposition"
+sidebarTitle: "Force Decomposition"
+description: "How FF-PINN factorizes acoustic radiation force and Stokes drag into independent spatial, temporal, and velocity factors for efficient surrogate modeling."
+---
+
+The central design decision in FF-PINN is to never train a single network that takes `(x, v_x, t)` as a joint input. Instead, both physical forces are **decomposed into factors that depend on only one scalar at a time**, and each factor gets its own dedicated sub-network. This decomposition is not an approximation — it follows directly from the physics of a standing acoustic wave, where the space and time dependences of the field separate analytically.
+
+## Why decompose forces
+
+A network with a three-dimensional input `(x, v_x, t)` must learn a function on a product space. For acoustic waves, that function is highly oscillatory in two of its three dimensions (`x` and `t`), and each oscillation period spans only a small fraction of the domain. Fitting such a function accurately requires either a very large network or enormous amounts of training data.
+
+Factorization breaks the problem into three sub-problems you can solve independently, each over a single scalar:
+
+- **Spatial networks** learn one period of a trigonometric function over ~34 mm.
+- **Temporal networks** learn one period over ~100 µs.
+- **Velocity network** learns the near-linear drag response over ±0.1 m/s.
+
+Each sub-problem is far easier to fit, converges faster, and requires fewer parameters. At inference time you evaluate five small networks and multiply their outputs — an operation that is essentially free compared to the network forward passes themselves.
+
+## Acoustic radiation force decomposition
+
+The analytical ARF on a sphere in a standing plane wave is derived in `mechanisms/ARF.py`. It computes the pressure difference across the front and back of the particle:
+
+```python
+def compute_pressure_gradient_and_apply_arf(positions, radii, time):
+    """
+    F_p = π d_p² [p(x - √2 d_p/4, t) - p(x + √2 d_p/4, t)] / 4
+    """
+    for i, (x, y) in enumerate(positions):
+        d_p = 2 * radii[i]
+        offset = np.sqrt(2) * d_p / 4
+
+        x_front = x - offset
+        x_back  = x + offset
+
+        k = 2 * np.pi / wavelength
+        omega = 2 * np.pi * frequency
+        amplitude = get_amplitude()
+
+        p_front = (
+            2 * 2 * np.pi * amplitude * p_0 * gamma
+            * np.sin(k * x_front)
+            * np.cos(omega * time)
+            / wavelength
+        )
+        p_back = (
+            2 * 2 * np.pi * amplitude * p_0 * gamma
+            * np.sin(k * x_back)
+            * np.cos(omega * time)
+            / wavelength
+        )
+        pressure_diff = p_front - p_back
+        force_magnitude = np.pi * d_p**2 * pressure_diff / 4
+```
+
+Expanding `p_front - p_back` for small offsets, the resulting force takes the form:
+
+```
+F_ARF(x, t) ≈ C_ARF · sin(kx) · cos(ωt)
+```
+
+This is an **exactly separable** product of a function of `x` alone and a function of `t` alone. FF-PINN exploits this by assigning one network to each factor:
+
+```
+F_ARF(x, t) ≈ N_ARFx(x) × N_ARFt(t)
+```
+
+`N_ARFx` learns the spatial envelope `∝ sin(kx)` and `N_ARFt` learns the temporal carrier `cos(ωt)`. The physical magnitude is encoded in the normalization statistics stored in the companion JSON files.
+
+## Stokes drag decomposition
+
+The Stokes drag on a particle moving at velocity `v_x` in a fluid with local velocity `u_air(x, t)` is:
+
+```
+F_Stokes = -c_d · (v_x - u_air(x, t))
+```
+
+where `c_d = 3π μ d_p / C_c` is the Cunningham-corrected drag coefficient (from `mechanisms/Stokes_drag.py`). The fluid velocity in a standing acoustic wave is:
+
+```
+u_air(x, t) = -ω A · cos(kx) · cos(ωt)
+```
+
+which is again separable in space and time. Splitting the drag into two terms gives:
+
+```
+F_Stokes(x, v_x, t) = -c_d · v_x  +  c_d · u_air(x, t)
+                     = -c_d · v_x  +  s · cos(kx) · cos(ωt)
+```
+
+where `s = c_d · ω · A` is a scalar amplitude that can be computed analytically from the SPL. FF-PINN learns the two oscillatory factors independently:
+
+```
+F_Stokes ≈ -c_d · v_x  +  s · N_Sx(x) · N_St(t)
+```
+
+`N_Sx` learns the cosine spatial modulation `cos(kx)` and `N_St` learns the cosine temporal modulation `cos(ωt)`. The resistive drag term `−c_d · v_x` uses the raw particle velocity directly, with `c_d` computed analytically from the fluid viscosity, particle diameter, and Cunningham correction factor. A fifth sub-network `N_Sv` is trained to the identity function `v_x → v_x` and is included in the model for architectural completeness, but the force assembler applies `v_x` analytically rather than routing it through the network.
+
+## The full combined force
+
+Putting the two decompositions together gives the expression that `PhysicalUnifiedModel.forward` evaluates at every timestep:
+
+```
+F_total(x, v_x, t) =  N_ARFx(x) · N_ARFt(t)
+                    − c_d · v_x
+                    + s   · N_Sx(x) · N_St(t)
+```
+
+where `s = c_d · ω · A`. In Python, this assembly happens as follows (condensed from `mechanisms/UNIFIED_PINN.py`):
+
+```python
+# ARF contribution
+arf_total = arf_fx.squeeze() * arf_ft.squeeze()
+
+# Stokes acoustic streaming amplitude
+drag_coeff = 3.0 * np.pi * mu * diameter / cunningham   # c_d
+A = sound_pressure / (rho_0 * c_0 * omega)
+u_air = -omega * A * stokes_fx.squeeze() * stokes_ft.squeeze()
+
+# Full Stokes drag: F = -c_d * (v_x - u_air)
+stokes_total = -drag_coeff * (vx - u_air)
+
+# Combined
+total_fx = arf_total + stokes_total
+```
+
+The particle velocity `vx` enters the Stokes term analytically — the drag coefficient and raw velocity are applied around the learned spatial (`stokes_fx`) and temporal (`stokes_ft`) modulations of the air velocity. This keeps all physical constants explicit and makes the model straightforward to audit.
+
+<Note>
+`StokesNetV` (the velocity sub-network) is loaded and evaluated during the `PhysicalUnifiedModel` forward pass for completeness, but the resistive drag term uses the raw particle velocity `vx` directly rather than the network output. Because `StokesNetV` is trained to learn the identity function `v_x → v_x`, the two are numerically equivalent; the explicit analytic path avoids any small approximation error from the learned surrogate.
+</Note>
+
+## Physical justification for separability
+
+Separability holds exactly for an ideal standing plane wave, because the pressure field is a product of a purely spatial sinusoid and a purely temporal cosine. In real environments, standing waves may have reflections or gradients that break exact separability. For the target scenario — a 1-D resonant chamber at 10 kHz with sound pressure level 168.5 dB — the analytical standing-wave model is an excellent approximation, and the PINN training validates this by achieving sub-1% relative error on the analytical target.
+
+The decomposition also makes the model **physically interpretable**: you can inspect each sub-network output individually to understand the spatial distribution of ARF, the temporal phase of the force, or the velocity-dependent drag contribution, rather than treating the entire model as a black box.
+
+## How forces combine in the time integrator
+
+At each step of the symplectic-Euler integrator in `other_files/PINN_main.py`, the five sub-network outputs are fetched and combined into a single force vector per particle:
+
+```python
+# Five sub-network forward passes (batched over N particles):
+arf_fx_factor   = models['arf_x'](x_norm_arf)       # N_ARFx(x) ~ sin(kx)
+arf_ft_factor   = models['arf_t'](t_norm_arf)       # N_ARFt(t) ~ cos(ωt)
+stokes_fx_factor = models['stokes_x'](x_norm_stokes)  # N_Sx(x) ~ cos(kx)
+stokes_ft_factor = models['stokes_t'](t_norm_stokes)  # N_St(t) ~ cos(ωt)
+# models['stokes_v'] is also evaluated; the raw vx is used for the resistive term
+
+# Physical constants
+drag_coeff = 3.0 * np.pi * 1.8e-5 * 2e-6 / 1.083    # c_d
+A = sound_pressure / (1.225 * 340 * 2 * np.pi * frequency)
+stokes_amp = 2 * np.pi * frequency * A               # ω · A
+
+# Force assembly
+arf_total    = arf_fx_factor * arf_ft_factor
+stokes_total = -drag_coeff * (vx - stokes_amp * stokes_ft_factor * stokes_fx_factor)
+F_n          = arf_total + stokes_total
+
+# Symplectic-Euler integration step
+v_new = v_n + (F_n / mass) * dt
+x_new = x_n + v_new * dt
+```
+
+See the [Sub-Networks](/concepts/sub-networks) page for the exact architecture, parameter counts, and normalization conventions of each of the five networks.
