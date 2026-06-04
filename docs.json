@@ -65,6 +65,13 @@
               "reference/benchmarks",
               "reference/troubleshooting"
             ]
+          },
+          {
+            "group": "Research",
+            "icon": "flask",
+            "pages": [
+              "research/overview.mdx"
+            ]
           }
         ]
       }
